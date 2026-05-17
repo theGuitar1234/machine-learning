@@ -1,0 +1,21 @@
+### .pyc ###
+*.pyc
+
+### data/ ###
+data/
+
+### .venv/ ###
+.venv/
+
+### build/ ###
+build/
+
+### dist/ ###
+dist/
+
+### docs/ ###
+docs/
+
+### .npz ###
+*.npz
+
