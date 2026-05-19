@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from enum import Enum
+from typing import override
 
 from sklearn.model_selection import StratifiedKFold
 from sklearn.datasets import make_regression
@@ -530,59 +531,9 @@ class ANonSeriousDecisionTree:
         if self.random_criterion is not None:
             match self.random_criterion:
                 case self.RandomCriterion.RANDOM_FEATURE:
-                    max_feature_method = None
-                    match self.max_features:
-                        case self.MaxFeatures.SQRT:
-                            max_feature_method = np.sqrt
-                        case self.MaxFeatures.LOG2:
-                            max_feature_method = lambda x: np.log2(
-                                x + self.config.epsilon
-                            )
-                        case _:
-                            raise ValueError(
-                                f"Unsupported {self.max_features}, supported values are {list(self.MaxFeatures)}"
-                            )
-                    ratio_size = self.max_features_ratio * number_of_features
-                    number_of_features = (
-                        ratio_size
-                        if ratio_size <= number_of_features
-                        else number_of_features
-                    )
-                    number_of_features = (
-                        number_of_features
-                        if number_of_features <= self.max_number_of_features
-                        else self.max_number_of_features
-                    )
-
-                    candidate_count = max(
-                        1, int(max_feature_method(number_of_features))
-                    )
-                    features = self.rng.choice(
-                        features, size=candidate_count, replace=False
-                    )
+                    features = self.random_feature_criterion(self, number_of_features)
                 case self.RandomCriterion.RANDOM_SPLIT:
-                    while True:
-                        random_feature = self.rng.choice(
-                            features, size=1, replace=False
-                        )[0]
-
-                        values = X[:, random_feature]
-
-                        min_value = min(values)
-                        max_value = max(values)
-
-                        if min_value == max_value:
-                            continue
-
-                        threshold = self.rng.uniform(min_value, max_value)
-
-                        left_mask = values > threshold
-                        right_mask = values <= threshold
-
-                        if len(values[left_mask]) == 0 or len(values[right_mask]) == 0:
-                            continue
-
-                        return random_feature, threshold
+                    return self.random_split_criterion(features)
                 case _:
                     raise ValueError(
                         f"Unsupported {self.random_criterion}, supported values are {list(self.RandomCriterion)}"
@@ -684,58 +635,9 @@ class ANonSeriousDecisionTree:
         if self.random_criterion is not None:
             match self.random_criterion:
                 case self.RandomCriterion.RANDOM_FEATURE:
-                    max_feature_method = None
-                    match self.max_features:
-                        case self.MaxFeatures.SQRT:
-                            max_feature_method = np.sqrt
-                        case self.MaxFeatures.LOG2:
-                            max_feature_method = lambda x: np.log2(
-                                x + self.config.epsilon
-                            )
-                        case _:
-                            raise ValueError(
-                                f"Unsupported {self.max_features}, supported values are {list(self.MaxFeatures)}"
-                            )
-                    ratio_size = self.max_features_ratio * number_of_features
-                    number_of_features = (
-                        ratio_size
-                        if ratio_size <= number_of_features
-                        else number_of_features
-                    )
-                    number_of_features = (
-                        number_of_features
-                        if number_of_features <= self.max_number_of_features
-                        else self.max_number_of_features
-                    )
-                    candidate_count = max(
-                        1, int(max_feature_method(number_of_features))
-                    )
-                    features = self.rng.choice(
-                        features, size=candidate_count, replace=False
-                    )
+                    features = self.random_feature_criterion(number_of_features)
                 case self.RandomCriterion.RANDOM_SPLIT:
-                    while True:
-                        random_feature = self.rng.choice(
-                            features, size=1, replace=False
-                        )[0]
-
-                        values = X[:, random_feature]
-
-                        min_value = min(values)
-                        max_value = max(values)
-
-                        if min_value == max_value:
-                            continue
-
-                        threshold = self.rng.uniform(min_value, max_value)
-
-                        left_mask = values > threshold
-                        right_mask = values <= threshold
-
-                        if len(values[left_mask]) == 0 or len(values[right_mask]) == 0:
-                            continue
-
-                        return random_feature, threshold
+                    return self.random_split_criterion(features)
                 case _:
                     raise ValueError(
                         f"Unsupported {self.random_criterion}, supported values are {list(self.RandomCriterion)}"
@@ -827,6 +729,61 @@ class ANonSeriousDecisionTree:
         result = int(np.argmin(__weighted_average))
 
         return float(thresholds[result]), float(__weighted_average[result])
+
+    def random_split_criterion(self, features):
+        while True:
+            random_feature = self.rng.choice(features, size=1, replace=False)[0]
+
+            values = X[:, random_feature]
+
+            min_value = min(values)
+            max_value = max(values)
+
+            if min_value == max_value:
+                continue
+
+            threshold = self.rng.uniform(min_value, max_value)
+
+            left_mask = values > threshold
+            right_mask = values <= threshold
+
+            if len(values[left_mask]) == 0 or len(values[right_mask]) == 0:
+                continue
+
+            return random_feature, threshold
+    
+    def random_feature_criterion(self, number_of_features):
+        max_feature_method = None
+        match self.max_features:
+            case self.MaxFeatures.SQRT:
+                max_feature_method = np.sqrt
+            case self.MaxFeatures.LOG2:
+                max_feature_method = lambda x: np.log2(
+                    x + self.config.epsilon
+                )
+            case _:
+                raise ValueError(
+                    f"Unsupported {self.max_features}, supported values are {list(self.MaxFeatures)}"
+                )
+        ratio_size = self.max_features_ratio * number_of_features
+        number_of_features = (
+            ratio_size
+            if ratio_size <= number_of_features
+            else number_of_features
+        )
+        number_of_features = (
+            number_of_features
+            if number_of_features <= self.max_number_of_features
+            else self.max_number_of_features
+        )
+
+        candidate_count = max(
+            1, int(max_feature_method(number_of_features))
+        )
+        features = self.rng.choice(
+            features, size=candidate_count, replace=False
+        )
+        return features
 
     def mse(self, y, y_hat):
         return np.mean((y - y_hat) ** 2)
@@ -2021,6 +1978,125 @@ class ANonSeriousRandomForest:
         plt.show()
 
 
+class ANonSeriousIsolationRandomTree(ANonSeriousDecisionTree):
+
+    def __init__(self, max_depth=10, seed=0, minimum_population_size=1, vectorized=False, categorical=False):
+        self.rng = np.random.default_rng(seed)
+        self.root = None
+        self.max_depth = max_depth
+        self.minimum_population_size = minimum_population_size
+        self.vectorized = vectorized
+        self.categorical = categorical
+
+    @override
+    def fit(self, X, verbose=False):
+        self.X_train_ = X
+        self.root = ANonSeriousNode()
+        self.root.is_root = True
+        self.root.depth = 0
+        self.root.sub_population = np.ones(self.X_train_.shape[0], dtype=np.bool_)
+        self.fit_node(self.root)
+        if verbose:
+            print(f"""  Training finished.
+    - Depth                     : {self.depth()}
+    - Number of nodes           : {self.count_nodes()}
+    - Number of leaves          : {self.count_nodes(only_leaves=True)}""")
+
+    @override
+    def fit_node(self, node):
+        population_size = int(np.sum(node.sub_population))
+
+        if (
+            population_size <= self.minimum_population_size
+            or node.depth >= self.max_depth
+        ):
+            return self._prune_node(node)
+        sub_x = self.X_train_[node.sub_population, :]
+
+        ranges = np.ptp(sub_x, axis=0)
+        valid_features = np.where(ranges > 0)[0]
+
+        if len(valid_features) == 0:
+            self._prune_node(node)
+        feature = self.rng.choice(valid_features)
+
+        if np.all(np.ptp(sub_x, axis=0) == 0):
+            node.feature = 0
+            node.threshold = float(sub_x[0, 0])
+            node.left = self.get_leaf(
+                node, np.zeros_like(node.sub_population, dtype=np.bool_)
+            )
+            b = self.get_leaf(node, node.sub_population)
+            node.right = b
+            return
+        node.feature, node.threshold = self.random_split_criterion(node)
+        feat_col = self.X_train_[:, node.feature]
+        go_left = feat_col > node.threshold
+        left_population = node.sub_population & go_left
+        right_population = node.sub_population & (~go_left)
+        child_depth = node.depth + 1
+
+        is_left_leaf = (
+            child_depth >= self.max_depth
+            or np.sum(left_population) <= self.minimum_population_size
+        )
+        is_right_leaf = (
+            child_depth >= self.max_depth
+            or np.sum(right_population) <= self.minimum_population_size
+        )
+
+        if is_left_leaf:
+            node.left = self.get_leaf(node, left_population)
+        else:
+            node.left = self.get_node(node, left_population)
+            self.fit_node(node.left)
+        if is_right_leaf:
+            node.right = self.get_leaf(node, right_population)
+        else:
+            node.right = self.get_node(node, right_population)
+            self.fit_node(node.right)
+
+    def random_split_criterion(self, node):
+        number_of_features = self.X_train_.shape[1]
+        features = np.arange(number_of_features)
+        while True:
+            random_feature = self.rng.choice(features, size=1, replace=False)[0]
+
+            values = X[:, random_feature]
+
+            min_value = min(values)
+            max_value = max(values)
+
+            if min_value == max_value:
+                continue
+
+            threshold = self.rng.uniform(min_value, max_value)
+
+            left_mask = values > threshold
+            right_mask = values <= threshold
+
+            if len(values[left_mask]) == 0 or len(values[right_mask]) == 0:
+                continue
+
+            return random_feature, threshold
+
+    def get_leaf(self, node, sub_population):
+        leaf = ANonSeriousNode()
+        leaf.is_leaf = True
+        leaf_depth = node.depth + 1
+        leaf.depth = leaf_depth
+        leaf.value = leaf_depth
+        leaf.sub_population = sub_population
+        leaf.number_of_samples = sum(sub_population)
+        return leaf
+
+class ANonSeriousIsolationForest:
+    pass
+
+class ANonSeriousIsolationRandomForest:
+    pass
+
+
 if __name__ == "__main__":
 
     def circle_of_clouds(
@@ -2140,49 +2216,98 @@ if __name__ == "__main__":
 
     # bagging_trees.visualize_tree(feature1, feature2)
 
-    tree = ANonSeriousDecisionTree(
-        max_depth=5,
-        minimum_population_size=5,
-        minimum_gain=0.0,
-        seed=seed,
-        tree_type=ANonSeriousDecisionTree.TreeType.REGRESSION,
-        vectorized=True,
-    )
+    # tree = ANonSeriousDecisionTree(
+    #     max_depth=5,
+    #     minimum_population_size=5,
+    #     minimum_gain=0.0,
+    #     seed=seed,
+    #     tree_type=ANonSeriousDecisionTree.TreeType.REGRESSION,
+    #     vectorized=True,
+    # )
 
-    tree.fit(X_train, y_train, node=True)
+    # tree.fit(X_train, y_train, node=True)
 
-    tree.visualize_tree(feature1, feature2)
+    # tree.visualize_tree(feature1, feature2)
 
-    predictions = tree.predict(X_test)
-    print(f"Predictions : {predictions}")
-    print("\nRegression Tree evaluation : ")
-    print(tree.evaluate_dataset(X_test, y_test))
+    # predictions = tree.predict(X_test)
+    # print(f"Predictions : {predictions}")
+    # print("\nRegression Tree evaluation : ")
+    # print(tree.evaluate_dataset(X_test, y_test))
 
-    print("\nInitializing a Random Forest...")
-    random_forest = ANonSeriousRandomForest(
-        information_gain=ANonSeriousDecisionTree.InformationGain.GINI,
-        random_criterion=ANonSeriousDecisionTree.RandomCriterion.RANDOM_FEATURE,
-        _bootstrap=True,
-        forest_type=ANonSeriousRandomForest.ForestType.REGRESSION,
-        voting=ANonSeriousRandomForest.Voting.SOFT,
-    )
+    # print("\nInitializing a Random Forest...")
+    # random_forest = ANonSeriousRandomForest(
+    #     information_gain=ANonSeriousDecisionTree.InformationGain.GINI,
+    #     random_criterion=ANonSeriousDecisionTree.RandomCriterion.RANDOM_FEATURE,
+    #     _bootstrap=True,
+    #     forest_type=ANonSeriousRandomForest.ForestType.REGRESSION,
+    #     voting=ANonSeriousRandomForest.Voting.SOFT,
+    # )
 
-    print("\nFitting the Random Forest...")
-    limit = 5
-    random_forest.fit(X_train, y_train, verbose=True)
+    # print("\nFitting the Random Forest...")
+    # limit = 5
+    # random_forest.fit(X_train, y_train, verbose=True)
 
-    if random_forest.forest_type is ANonSeriousRandomForest.ForestType.CLASSIFICATION:
-        _, forest_accuracy = random_forest.evaluate_random_forest(X_test, y_test)
-        probabilities = random_forest.predict_probabilities(X_test[:limit])
-        print(f"\nTest Accuracy : {forest_accuracy}")
-        print(f"{probabilities.sum(axis=1)}\nProbabilities {probabilities}")
-    else:
-        evaluation = random_forest.evaluate_random_forest(X_test, y_test)
-        predictions = random_forest.predict(X_test)
-        print(f"\nEvaluation {evaluation}")
-        print(f"Predictions {predictions}")
+    # if random_forest.forest_type is ANonSeriousRandomForest.ForestType.CLASSIFICATION:
+    #     _, forest_accuracy = random_forest.evaluate_random_forest(X_test, y_test)
+    #     probabilities = random_forest.predict_probabilities(X_test[:limit])
+    #     print(f"\nTest Accuracy : {forest_accuracy}")
+    #     print(f"{probabilities.sum(axis=1)}\nProbabilities {probabilities}")
+    # else:
+    #     evaluation = random_forest.evaluate_random_forest(X_test, y_test)
+    #     predictions = random_forest.predict(X_test)
+    #     print(f"\nEvaluation {evaluation}")
+    #     print(f"Predictions {predictions}")
 
-    # print("\nOOB Evaluation : ")
-    # random_forest.oob_evaluation(verbose=True)
+    # # print("\nOOB Evaluation : ")
+    # # random_forest.oob_evaluation(verbose=True)
 
-    random_forest.visualize_tree(feature1, feature2)
+    # random_forest.visualize_tree(feature1, feature2)
+
+    def np_extrema(arr):
+        return np.min(arr), np.max(arr)
+
+    def visualize_bassins(ax, model, x_min, x_max, y_min, y_max, cmap):
+        assert model.X_train_.shape[1] == 2, "Not a 2D example"
+        X = np.linspace(x_min, x_max, 100)
+        Y = np.linspace(y_min, y_max, 100)
+        XX, YY = np.meshgrid(X, Y)
+        XX_flat = XX.ravel()
+        YY_flat = YY.ravel()
+        Z = model.predict(np.vstack([XX_flat, YY_flat]).T)
+        ax.pcolormesh(XX, YY, Z.reshape([100, 100]), cmap=cmap, shading="auto")
+
+    def visualize_training_dataset_2D(ax, model, cmap):
+        ax.scatter(
+            model.X_train_[:, 0], model.X_train_[:, 1], c=model.target, cmap=cmap
+        )
+
+    def visualize_model_2D(model, cmap=plt.cm.Set1):
+        assert model.X_train_.shape[1] == 2, "Not a 2D example"
+
+        x_min, x_max = np_extrema(model.X_train_[:, 0])
+        y_min, y_max = np_extrema(model.X_train_[:, 1])
+        fig, axes = plt.subplots(1, 2, figsize=(15, 7))
+        for ax in axes:
+            ax.set_xlim(x_min, x_max)
+            ax.set_ylim(y_min, y_max)
+        visualize_training_dataset_2D(axes[0], model, cmap)
+        visualize_bassins(axes[1], model, x_min, x_max, y_min, y_max, cmap)
+        plt.savefig("bassins3.png")
+        plt.show()
+
+    X_train_, _ = circle_of_clouds(1, 100, sigma=0.2)  # a cloud
+    X_train_[0] = [-1, 0]  # an outlier
+
+    fig, axes = plt.subplots(3, 3, figsize=(12, 12))
+    plt.subplots_adjust(hspace=0.3, wspace=0.3)
+    axes[0, 0].scatter(X_train_[:, 0], X_train_[:, 1])
+    axes[0, 0].set_title("a cloud and an outlier")
+    for i in range(1, 9):
+        T = ANonSeriousIsolationRandomTree(max_depth=8, seed=i)
+        T.fit(X_train_)
+        visualize_bassins(
+            axes[i % 3, i // 3], T, -1.2, 1.5, -0.5, 0.5, cmap=plt.cm.RdBu
+        )
+        axes[i % 3, i // 3].set_title(f"bassins of isolation tree for seed={i}")
+    plt.savefig("bassins3.png")
+    plt.show()

@@ -125,7 +125,14 @@ if __name__ == "__main__":
 
     # _, test_accuracy = best_tree.evaluate_dataset(X_test, y_test)
     # print(f"\nTest Accuracy: {test_accuracy}")
-
-
-
+    
+            diff = 0
+        while diff == 0:
+            feature = self.rng.integers(0, self.X_train_.shape[1])
+            vals = self.X_train_[:, feature][node.sub_population]
+            feature_min, feature_max = self.np_extrema(vals)
+            diff = feature_max - feature_min
+        x = self.rng.uniform()
+        threshold = (1 - x) * feature_min + x * feature_max
+        return feature, threshold
 
