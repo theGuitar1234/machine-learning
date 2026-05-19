@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from enum import Enum
 
 from sklearn.model_selection import StratifiedKFold
@@ -18,7 +19,7 @@ import copy
 import math
 
 
-class Node:
+class ANonSeriousNode:
     def __init__(self, feature=None, threshold=None):
         self.feature = feature
         self.threshold = threshold
@@ -101,6 +102,64 @@ class Node:
 
         return count
 
+    def get_leaves_below(self):
+        leaves = []
+        if self.is_leaf or self.value is not None:
+            return [self]
+
+        if self.left is not None:
+            leaves.extend(self.left.get_leaves_below())
+
+        if self.right is not None:
+            leaves.extend(self.right.get_leaves_below())
+
+        return leaves
+
+    def update_bounds_below(self):
+        if self.is_root:
+            # self.upper = {0: np.inf}
+            # self.lower = {0: -np.inf}
+            self.upper = {}
+            self.lower = {}
+
+        if self.left is not None:
+            self.left.lower = dict(self.lower)
+            self.left.upper = dict(self.upper)
+
+            previous = self.left.lower.get(self.feature, -np.inf)
+            self.left.lower[self.feature] = max(previous, self.threshold)
+            self.left.update_bounds_below()
+        if self.right is not None:
+            self.right.lower = dict(self.lower)
+            self.right.upper = dict(self.upper)
+
+            previous = self.right.upper.get(self.feature, np.inf)
+            self.right.upper[self.feature] = min(previous, self.threshold)
+            self.right.update_bounds_below()
+
+    def update_indicator(self):
+
+        def is_large_enough(X):
+            if not hasattr(self, "lower") or self.lower is None or len(self.lower) == 0:
+                return np.ones(X.shape[0], dtype=np.bool_)
+            checks = np.array(
+                [np.greater(X[:, key], self.lower[key]) for key in self.lower.keys()]
+            )
+            return np.all(checks, axis=0)
+
+        def is_small_enough(X):
+            if not hasattr(self, "upper") or self.upper is None or len(self.upper) == 0:
+                return np.ones(X.shape[0], dtype=np.bool_)
+            checks = np.array(
+                [np.less_equal(X[:, key], self.upper[key]) for key in self.upper.keys()]
+            )
+            return np.all(checks, axis=0)
+
+        self.indicator = lambda x: np.all(
+            np.array([is_large_enough(x), is_small_enough(x)]),
+            axis=0,
+        )
+
 
 class ANonSeriousDecisionTree:
 
@@ -130,6 +189,10 @@ class ANonSeriousDecisionTree:
         RMSE = 3
         R2 = 4
 
+    @dataclass
+    class TrainDefaults:
+        epsilon: float = 1e-5
+
     def __init__(
         self,
         minimum_population_size=2,
@@ -148,11 +211,14 @@ class ANonSeriousDecisionTree:
         max_features=MaxFeatures.SQRT,
         tree_type=TreeType.CLASSIFICATION,
         error=Error.MSE,
+        vectorized=False,
+        config=TrainDefaults(),
     ):
+        if categorical and vectorized:
+            raise RuntimeError("Categorical data can't be used for vectorized search")
         self.rng = np.random.default_rng(seed)
         self.root = None
         self.max_depth = max_depth
-        self.categorical = categorical
         self.adjacent = adjacent
         self.minimum_population_size = minimum_population_size
         self.minimum_split_size = minimum_split_size
@@ -169,6 +235,9 @@ class ANonSeriousDecisionTree:
         self.max_features = max_features
         self.tree_type = tree_type
         self.error = error
+        self.vectorized = vectorized
+        self.categorical = categorical
+        self.config = config
 
     def __str__(self):
         return str(self.root)
@@ -182,7 +251,31 @@ class ANonSeriousDecisionTree:
     def get_leaves(self):
         return self.root.get_leaves_below()
 
-    def fit(self, X, y, verbose=False):
+    def get_leaf(self, node, sub_population):
+        y = self.y_train_[sub_population]
+        match self.tree_type:
+            case self.TreeType.CLASSIFICATION:
+                value = int(np.argmax(np.bincount(y)))
+            case self.TreeType.REGRESSION:
+                value = np.mean(y)
+            case _:
+                raise ValueError(
+                    f"Unsupported {self.tree_type}, supported values are {list(self.TreeType)}"
+                )
+        leaf = ANonSeriousNode()
+        leaf.value = value
+        leaf.is_leaf = True
+        leaf.depth = node.depth + 1
+        leaf.sub_population = sub_population
+        return leaf
+
+    def get_node(self, node, sub_population):
+        _node = ANonSeriousNode()
+        _node.depth = node.depth + 1
+        _node.sub_population = sub_population
+        return _node
+
+    def fit(self, X, y, verbose=False, node=False):
         if y.ndim == 2:
             y = np.argmax(y, axis=1)
         if X.shape[0] != y.shape[0]:
@@ -194,7 +287,14 @@ class ANonSeriousDecisionTree:
         self.classes_, class_counts = np.unique(y, return_counts=True)
         self.class_priors_ = class_counts / len(y)
 
-        self.root = self._build_tree(X, y, depth=0)
+        if node:
+            self.root = ANonSeriousNode()
+            self.root.is_root = True
+            self.root.depth = 0
+            self.root.sub_population = np.ones(self.X_train_.shape[0], dtype=bool)
+            self.fit_node(self.root)
+        else:
+            self.root = self._build_tree(X, y, depth=0)
 
         if verbose:
             number_of_leaves = self.count_nodes(only_leaves=True)
@@ -225,21 +325,22 @@ class ANonSeriousDecisionTree:
         return self
 
     def _build_tree(self, X, y, depth):
-        node = Node()
+        node = ANonSeriousNode()
         if not self.is_root_set:
             node.is_root = True
             self.is_root_set = True
+
         node.depth = depth
         node.max_depth = self.str_max_depth
-
-        if self.tree_type is self.TreeType.CLASSIFICATION:
-            node.majority_class = self._majority_class(y)
+        match self.tree_type:
+            case self.TreeType.CLASSIFICATION:
+                node.majority_class = self._majority_class(y)
+                node.value = None
+            case self.TreeType.REGRESSION:
+                node.value = np.mean(y)
         node.number_of_samples = len(y)
         _, node.leaf_error = self._leaf_error(y)
         node.number_of_classes = self._class_counts(y)
-
-        if self.tree_type is self.TreeType.REGRESSION:
-            node.value = np.mean(y)
 
         if (
             depth >= self.max_depth
@@ -317,6 +418,107 @@ class ANonSeriousDecisionTree:
 
         return node
 
+    def fit_node(self, node):
+        X = self.X_train_[node.sub_population]
+        y = self.y_train_[node.sub_population]
+
+        node.max_depth = self.str_max_depth
+        node.number_of_samples = len(y)
+        match self.tree_type:
+            case self.TreeType.CLASSIFICATION:
+                node.majority_class = self._majority_class(y)
+                node.value = None
+            case self.TreeType.REGRESSION:
+                node.value = np.mean(y)
+
+        _, node.leaf_error = self._leaf_error(y)
+        node.number_of_classes = self._class_counts(y)
+
+        if (
+            node.depth >= self.max_depth
+            or len(set(y)) == 1
+            or len(y) <= self.minimum_population_size
+        ):
+            node.is_leaf = True
+            match self.tree_type:
+                case self.TreeType.CLASSIFICATION:
+                    node.value = self._majority_class(y)
+                case self.TreeType.REGRESSION:
+                    node.value = np.mean(y)
+                case _:
+                    raise ValueError(
+                        f"Unsupported {self.tree_type}, supported values are {list(self.TreeType)}"
+                    )
+            return node
+
+        match self.tree_type:
+            case self.TreeType.CLASSIFICATION:
+                feature, threshold = self._classification_split(X, y)
+            case self.TreeType.REGRESSION:
+                feature, threshold = self._regression_split(X, y)
+            case _:
+                raise ValueError(
+                    f"Unsupported {self.tree_type}, supported values are {list(self.TreeType)}"
+                )
+
+        if self.log:
+            print(
+                f"Fitting the node... [Best Feature : {feature}] [Best Split : {threshold}]"
+            )
+
+        if feature is None:
+            node.is_leaf = True
+            match self.tree_type:
+                case self.TreeType.CLASSIFICATION:
+                    node.value = self._majority_class(y)
+                case self.TreeType.REGRESSION:
+                    node.value = np.mean(y)
+                case _:
+                    raise ValueError(
+                        f"Unsupported {self.TreeType}, supported values are {list(self.TreeType)}"
+                    )
+            return node
+
+        node.feature = feature
+        node.threshold = threshold
+        node.value = None
+
+        if self.categorical:
+            left_mask = self.X_train_[:, feature] == threshold
+            right_mask = self.X_train_[:, feature] != threshold
+        else:
+            left_mask = self.X_train_[:, feature] > threshold
+            right_mask = self.X_train_[:, feature] <= threshold
+        left_population = node.sub_population & left_mask
+        right_population = node.sub_population & right_mask
+
+        if (
+            np.sum(left_population) < self.minimum_split_size
+            or np.sum(right_population) < self.minimum_split_size
+        ):
+            node.is_leaf = True
+            match self.tree_type:
+                case self.TreeType.CLASSIFICATION:
+                    node.value = self._majority_class(y)
+                case self.TreeType.REGRESSION:
+                    node.value = np.mean(y)
+                case _:
+                    raise ValueError(
+                        f"Unsupported {self.TreeType}, supported values are {list(self.TreeType)}"
+                    )
+            return node
+
+        node.left = ANonSeriousNode()
+        node.left.depth = node.depth + 1
+        node.left.sub_population = left_population
+
+        node.right = ANonSeriousNode()
+        node.right.depth = node.depth + 1
+        node.right.sub_population = right_population
+
+        self.fit_node(node.left)
+        self.fit_node(node.right)
+
     def _classification_split(self, X, y):
         best_feature = None
         best_threshold = None
@@ -333,7 +535,9 @@ class ANonSeriousDecisionTree:
                         case self.MaxFeatures.SQRT:
                             max_feature_method = np.sqrt
                         case self.MaxFeatures.LOG2:
-                            max_feature_method = np.log2
+                            max_feature_method = lambda x: np.log2(
+                                x + self.config.epsilon
+                            )
                         case _:
                             raise ValueError(
                                 f"Unsupported {self.max_features}, supported values are {list(self.MaxFeatures)}"
@@ -389,6 +593,16 @@ class ANonSeriousDecisionTree:
             order = np.argsort(values)
             sorted_values = values[order]
             categories = np.unique(sorted_values)
+
+            if self.vectorized:
+                category, _weighted_impurity = self._vectorized_split_search(
+                    X, y, feature
+                )
+                if _weighted_impurity < best_gain:
+                    best_gain = _weighted_impurity
+                    best_feature = feature
+                    best_threshold = category
+                continue
 
             if not self.categorical:
                 if self.adjacent:
@@ -463,7 +677,7 @@ class ANonSeriousDecisionTree:
         best_score = float("inf")
 
         parent_score = self.mse_mean(y)
-        
+
         number_of_features = X.shape[1]
         features = np.arange(number_of_features)
 
@@ -475,7 +689,9 @@ class ANonSeriousDecisionTree:
                         case self.MaxFeatures.SQRT:
                             max_feature_method = np.sqrt
                         case self.MaxFeatures.LOG2:
-                            max_feature_method = np.log2
+                            max_feature_method = lambda x: np.log2(
+                                x + self.config.epsilon
+                            )
                         case _:
                             raise ValueError(
                                 f"Unsupported {self.max_features}, supported values are {list(self.MaxFeatures)}"
@@ -491,13 +707,17 @@ class ANonSeriousDecisionTree:
                         if number_of_features <= self.max_number_of_features
                         else self.max_number_of_features
                     )
-                    candidate_count = max(1, int(max_feature_method(number_of_features)))
+                    candidate_count = max(
+                        1, int(max_feature_method(number_of_features))
+                    )
                     features = self.rng.choice(
                         features, size=candidate_count, replace=False
                     )
                 case self.RandomCriterion.RANDOM_SPLIT:
                     while True:
-                        random_feature = self.rng.choice(features, size=1, replace=False)[0]
+                        random_feature = self.rng.choice(
+                            features, size=1, replace=False
+                        )[0]
 
                         values = X[:, random_feature]
 
@@ -554,6 +774,60 @@ class ANonSeriousDecisionTree:
             return None, None
         return best_feature, best_threshold
 
+    def _vectorized_split_search(self, X, y, feature):
+        if self.categorical:
+            raise RuntimeError("Categorical data can't be used for vectorized search")
+        samples = X[:, feature]
+        size = y.size
+
+        unique_values = np.unique(samples)
+        thresholds = (unique_values[1:] + unique_values[:-1]) / 2
+        if thresholds.size == 0:
+            return (0.0, np.inf)
+
+        one_hot = np.eye(self.classes_.size, dtype=np.int32)[
+            np.searchsorted(self.classes_, y)
+        ]
+
+        left_mask = samples[:, None] > thresholds[None, :]
+        left_counts = left_mask.T.astype(int) @ one_hot
+        total_counts = np.sum(one_hot, axis=0, keepdims=True)
+        right_counts = total_counts - left_counts
+
+        left_total = np.sum(left_counts, axis=1)
+        right_total = size - left_total
+
+        left_probability = left_counts / left_total[:, None]
+        right_probability = right_counts / right_total[:, None]
+
+        __left = None
+        __right = None
+        __weighted_average = None
+        match self.information_gain:
+            case self.InformationGain.GINI:
+                __left = 1.0 - np.sum(left_probability**2, axis=1)
+                __right = 1.0 - np.sum(right_probability**2, axis=1)
+            case self.InformationGain.ENTROPY:
+                __left = -np.sum(
+                    left_probability * np.log2(left_probability + self.config.epsilon),
+                    axis=1,
+                )
+                __right = -np.sum(
+                    right_probability
+                    * np.log2(right_probability + self.config.epsilon),
+                    axis=1,
+                )
+            case _:
+                raise ValueError(
+                    f"Unsupported {self.information_gain}, supported values are {list(self.InformationGain)}"
+                )
+        __weighted_average = self.weighted_impurity(
+            __left, __right, left_total, right_total
+        )
+        result = int(np.argmin(__weighted_average))
+
+        return float(thresholds[result]), float(__weighted_average[result])
+
     def mse(self, y, y_hat):
         return np.mean((y - y_hat) ** 2)
 
@@ -591,7 +865,7 @@ class ANonSeriousDecisionTree:
             return 0
         _, counts = np.unique(y, return_counts=True)
         proportions = counts / len(y)
-        return -np.sum(proportions * np.log2(proportions))
+        return -np.sum(proportions * np.log2(proportions + self.config.epsilon))
 
     def weighted_impurity(self, left, right, left_size, right_size):
         total_size = left_size + right_size
@@ -807,7 +1081,7 @@ class ANonSeriousDecisionTree:
         low = errors / total
         high = 1.0
 
-        while high - low > 1e-12:
+        while high - low > self.config.epsilon:
             mid = (low + high) / 2
             probability = self.binomial_cdf(errors, total, mid)
             if probability > confidence_factor:
@@ -913,7 +1187,23 @@ class ANonSeriousDecisionTree:
                 return self.predict_one(x, node.right, leaf_node=leaf_node)
 
     def predict(self, X):
+        if self.vectorized:
+            return self.vectorized_predict_search(X)
         return np.array([self.predict_one(x) for x in X])
+
+    def vectorized_predict_search(self, X):
+        self._update_bounds()
+        leaves = self.get_leaves()
+        for leaf in leaves:
+            leaf.update_indicator()
+        values = np.array([leaf.value for leaf in leaves], dtype=float)
+        indicators = np.array([leaf.indicator(X) for leaf in leaves], dtype=float)
+        if not np.all(np.sum(indicators, axis=0) == 1):
+            raise RuntimeError("All column sums in the matrix must be equal to 1")
+        return values @ indicators
+
+    def _update_bounds(self):
+        self.root.update_bounds_below()
 
     def predict_probability(self, X):
         return np.array([self.predict_probability_one(x) for x in X])
@@ -1252,38 +1542,6 @@ class ANonSeriousDecisionTree:
         final_tree.fit(X_train_val, y_train_val, verbose=verbose)
         return final_tree
 
-    @staticmethod
-    def circle_of_clouds(
-        n_clouds, n_objects_by_cloud, radius=1, sigma=None, seed=0, angle=0
-    ):
-        rng = np.random.default_rng(seed)
-        if not sigma:
-            sigma = np.sqrt(2 - 2 * np.cos(2 * np.pi / n_clouds)) / 7
-
-        def rotate(x, k):
-            theta = 2 * k * np.pi / n_clouds + angle
-            m = np.matrix(
-                [[np.cos(theta), np.sin(theta)], [-np.sin(theta), np.cos(theta)]]
-            )
-            return np.matmul(x, m)
-
-        def cloud():
-            return (rng.normal(size=2 * n_objects_by_cloud) * sigma).reshape(
-                n_objects_by_cloud, 2
-            ) + np.array([radius, 0])
-
-        def target():
-            return np.array(
-                ([[i] * n_objects_by_cloud for i in range(n_clouds)]), dtype="int32"
-            ).ravel()
-
-        return (
-            np.concatenate(
-                [np.array(rotate(cloud(), k)) for k in range(n_clouds)], axis=0
-            ),
-            target(),
-        )
-
 
 class ANonSeriousBaggingTrees:
 
@@ -1447,38 +1705,6 @@ class ANonSeriousBaggingTrees:
         plt.pcolormesh(XX, YY, Z, cmap=cmap, shading="auto")
         plt.savefig("img/bassins_bggng_trs.png")
         plt.show()
-
-    @staticmethod
-    def circle_of_clouds(
-        n_clouds, n_objects_by_cloud, radius=1, sigma=None, seed=0, angle=0
-    ):
-        rng = np.random.default_rng(seed)
-        if not sigma:
-            sigma = np.sqrt(2 - 2 * np.cos(2 * np.pi / n_clouds)) / 7
-
-        def rotate(x, k):
-            theta = 2 * k * np.pi / n_clouds + angle
-            m = np.matrix(
-                [[np.cos(theta), np.sin(theta)], [-np.sin(theta), np.cos(theta)]]
-            )
-            return np.matmul(x, m)
-
-        def cloud():
-            return (rng.normal(size=2 * n_objects_by_cloud) * sigma).reshape(
-                n_objects_by_cloud, 2
-            ) + np.array([radius, 0])
-
-        def target():
-            return np.array(
-                ([[i] * n_objects_by_cloud for i in range(n_clouds)]), dtype="int32"
-            ).ravel()
-
-        return (
-            np.concatenate(
-                [np.array(rotate(cloud(), k)) for k in range(n_clouds)], axis=0
-            ),
-            target(),
-        )
 
 
 class ANonSeriousRandomForest:
@@ -1656,8 +1882,7 @@ class ANonSeriousRandomForest:
             case self.ForestType.CLASSIFICATION:
                 evaluated_samples = len(oob_predictions)
                 oob_accuracy = (
-                    np.mean(oob_predictions == oob_true_labels)
-                    * 100
+                    np.mean(oob_predictions == oob_true_labels) * 100
                     if evaluated_samples > 0
                     else None
                 )
@@ -1795,7 +2020,9 @@ class ANonSeriousRandomForest:
         plt.savefig("img/bassins_rndm_frst.png")
         plt.show()
 
-    @staticmethod
+
+if __name__ == "__main__":
+
     def circle_of_clouds(
         n_clouds, n_objects_by_cloud, radius=1, sigma=None, seed=0, angle=0
     ):
@@ -1827,32 +2054,38 @@ class ANonSeriousRandomForest:
             target(),
         )
 
-
-if __name__ == "__main__":
-
     # dataset = datasets.load_iris()
     seed = np.random.randint(0, 100)
-    X, y = ANonSeriousDecisionTree.circle_of_clouds(10, 30, seed=seed)
+
+    # X, y = ANonSeriousDecisionTree.circle_of_clouds(10, 30, seed=seed)
     feature1 = 0
     feature2 = 1
 
     # X = dataset.data[:, [feature_x, feature_y]]
     # X = dataset.data
     # y = dataset.target
-    
-    # X, y = make_regression(
-    #     n_samples=300,
-    #     n_features=2,
-    #     noise=15,
-    #     random_state=42,
-    # )
+
+    X, y = make_regression(
+        n_samples=300,
+        n_features=2,
+        noise=15,
+        random_state=seed,
+    )
 
     X_train_val, X_test, y_train_val, y_test = train_test_split(
-        X, y, test_size=0.20, random_state=42, stratify=y
+        X,
+        y,
+        test_size=0.20,
+        random_state=seed,
+        # stratify=y
     )
 
     X_train, X_val, y_train, y_val = train_test_split(
-        X_train_val, y_train_val, test_size=0.25, random_state=42, stratify=y_train_val
+        X_train_val,
+        y_train_val,
+        test_size=0.25,
+        random_state=seed,
+        # stratify=y_train_val
     )
 
     # 60% training
@@ -1907,28 +2140,31 @@ if __name__ == "__main__":
 
     # bagging_trees.visualize_tree(feature1, feature2)
 
-    # tree = ANonSeriousDecisionTree(
-    #     max_depth=5,
-    #     minimum_population_size=5,
-    #     minimum_gain=0.0,
-    #     seed=42,
-    #     tree_type=ANonSeriousDecisionTree.TreeType.REGRESSION,
-    # )
+    tree = ANonSeriousDecisionTree(
+        max_depth=5,
+        minimum_population_size=5,
+        minimum_gain=0.0,
+        seed=seed,
+        tree_type=ANonSeriousDecisionTree.TreeType.REGRESSION,
+        vectorized=True,
+    )
 
-    # tree.fit(X_train, y_train)
+    tree.fit(X_train, y_train, node=True)
 
-    # predictions = tree.predict(X_test)
-    # print(f"Predictions : {predictions}")
-    # print("\nRegression Tree evaluation : ")
-    # print(tree.evaluate_dataset(X_test, y_test))
+    tree.visualize_tree(feature1, feature2)
+
+    predictions = tree.predict(X_test)
+    print(f"Predictions : {predictions}")
+    print("\nRegression Tree evaluation : ")
+    print(tree.evaluate_dataset(X_test, y_test))
 
     print("\nInitializing a Random Forest...")
     random_forest = ANonSeriousRandomForest(
-        information_gain=ANonSeriousDecisionTree.InformationGain.ENTROPY,
-        random_criterion=ANonSeriousDecisionTree.RandomCriterion.RANDOM_SPLIT,
+        information_gain=ANonSeriousDecisionTree.InformationGain.GINI,
+        random_criterion=ANonSeriousDecisionTree.RandomCriterion.RANDOM_FEATURE,
         _bootstrap=True,
         forest_type=ANonSeriousRandomForest.ForestType.REGRESSION,
-        voting=ANonSeriousRandomForest.Voting.HARD,
+        voting=ANonSeriousRandomForest.Voting.SOFT,
     )
 
     print("\nFitting the Random Forest...")
@@ -1946,7 +2182,7 @@ if __name__ == "__main__":
         print(f"\nEvaluation {evaluation}")
         print(f"Predictions {predictions}")
 
-    print("\nOOB Evaluation : ")
-    random_forest.oob_evaluation(verbose=True)
+    # print("\nOOB Evaluation : ")
+    # random_forest.oob_evaluation(verbose=True)
 
     random_forest.visualize_tree(feature1, feature2)
