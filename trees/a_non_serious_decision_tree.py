@@ -38,6 +38,7 @@ class ANonSeriousNode:
         self.depth = None
         self.max_depth = float("inf")
         self.max_depth_reached = "MAX_DEPTH_REACHED"
+        self.categorical_split = False
 
     def left_add_prefix(self, text):
         if self.depth > self.max_depth:
@@ -637,7 +638,7 @@ class ANonSeriousDecisionTree:
                 case self.RandomCriterion.RANDOM_FEATURE:
                     features = self.random_feature_criterion(number_of_features)
                 case self.RandomCriterion.RANDOM_SPLIT:
-                    return self.random_split_criterion(features)
+                    return self.random_split_criterion(features, X)
                 case _:
                     raise ValueError(
                         f"Unsupported {self.random_criterion}, supported values are {list(self.RandomCriterion)}"
@@ -730,7 +731,7 @@ class ANonSeriousDecisionTree:
 
         return float(thresholds[result]), float(__weighted_average[result])
 
-    def random_split_criterion(self, features):
+    def random_split_criterion(self, features, X):
         while True:
             random_feature = self.rng.choice(features, size=1, replace=False)[0]
 
@@ -1978,15 +1979,42 @@ class ANonSeriousRandomForest:
         plt.show()
 
 
-class ANonSeriousIsolationRandomTree(ANonSeriousDecisionTree):
+class ANonSeriousIsolationRandomTree:
 
-    def __init__(self, max_depth=10, seed=0, minimum_population_size=1, vectorized=False, categorical=False):
+    def __init__(
+        self, 
+        max_depth=10, 
+        seed=0, 
+        minimum_population_size=1, 
+        vectorized=False, 
+        categorical=False,
+        categorical_features=None,
+    ):
+        if vectorized and (categorical or categorical_features is not None):
+            raise RuntimeError("Categorical data can't be used for vectorized search")
         self.rng = np.random.default_rng(seed)
         self.root = None
         self.max_depth = max_depth
         self.minimum_population_size = minimum_population_size
+        
         self.vectorized = vectorized
         self.categorical = categorical
+        self.categorical_features = categorical_features
+    
+    def depth(self):
+        return self.root.max_depth_below()
+
+    def count_nodes(self, only_leaves=False):
+        return self.root.count_nodes_below(only_leaves=only_leaves)
+    
+    def get_node(self, node, sub_population):
+        _node = ANonSeriousNode()
+        _node.depth = node.depth + 1
+        _node.sub_population = sub_population
+        return _node
+    
+    def get_leaves(self):
+        return self.root.get_leaves_below()
 
     @override
     def fit(self, X, verbose=False):
@@ -1995,12 +2023,22 @@ class ANonSeriousIsolationRandomTree(ANonSeriousDecisionTree):
         self.root.is_root = True
         self.root.depth = 0
         self.root.sub_population = np.ones(self.X_train_.shape[0], dtype=np.bool_)
+        
+        if self.categorical_features is not None:
+            self.categorical_features_ = set(self.categorical_features)
+        elif self.categorical:
+            self.categorical_features_ = set(range(self.X_train_.shape[1]))
+        else:
+            self.categorical_features_ = set()
+    
         self.fit_node(self.root)
         if verbose:
             print(f"""  Training finished.
     - Depth                     : {self.depth()}
     - Number of nodes           : {self.count_nodes()}
     - Number of leaves          : {self.count_nodes(only_leaves=True)}""")
+        
+        return self
 
     @override
     def fit_node(self, node):
@@ -2011,27 +2049,18 @@ class ANonSeriousIsolationRandomTree(ANonSeriousDecisionTree):
             or node.depth >= self.max_depth
         ):
             return self._prune_node(node)
-        sub_x = self.X_train_[node.sub_population, :]
 
-        ranges = np.ptp(sub_x, axis=0)
-        valid_features = np.where(ranges > 0)[0]
+        feature, threshold, categorical_split = self.random_split_criterion(node)
+        
+        if feature is None:
+            return self._prune_node(node)
+        node.feature, node.threshold, node.categorical_split = feature, threshold, categorical_split     
 
-        if len(valid_features) == 0:
-            self._prune_node(node)
-        feature = self.rng.choice(valid_features)
-
-        if np.all(np.ptp(sub_x, axis=0) == 0):
-            node.feature = 0
-            node.threshold = float(sub_x[0, 0])
-            node.left = self.get_leaf(
-                node, np.zeros_like(node.sub_population, dtype=np.bool_)
-            )
-            b = self.get_leaf(node, node.sub_population)
-            node.right = b
-            return
-        node.feature, node.threshold = self.random_split_criterion(node)
         feat_col = self.X_train_[:, node.feature]
-        go_left = feat_col > node.threshold
+        if node.categorical_split:
+            go_left = feat_col == node.threshold
+        else:
+            go_left = feat_col.astype(float) > node.threshold
         left_population = node.sub_population & go_left
         right_population = node.sub_population & (~go_left)
         child_depth = node.depth + 1
@@ -2057,28 +2086,85 @@ class ANonSeriousIsolationRandomTree(ANonSeriousDecisionTree):
             self.fit_node(node.right)
 
     def random_split_criterion(self, node):
-        number_of_features = self.X_train_.shape[1]
-        features = np.arange(number_of_features)
-        while True:
-            random_feature = self.rng.choice(features, size=1, replace=False)[0]
+        X_node = self.X_train_[node.sub_population]
 
-            values = X[:, random_feature]
+        valid_features = []
 
-            min_value = min(values)
-            max_value = max(values)
+        for feature in range(X_node.shape[1]):
+            values = X_node[:, feature]
 
-            if min_value == max_value:
-                continue
+            if feature in self.categorical_features_:
+                if np.unique(values).size > 1:
+                    valid_features.append(feature)
+            else:
+                numeric_values = values.astype(float)
+                if np.ptp(numeric_values) > 0:
+                    valid_features.append(feature)
 
-            threshold = self.rng.uniform(min_value, max_value)
+        if len(valid_features) == 0:
+            return None, None, None
 
-            left_mask = values > threshold
-            right_mask = values <= threshold
+        feature = self.rng.choice(valid_features)
+        values = X_node[:, feature]
 
-            if len(values[left_mask]) == 0 or len(values[right_mask]) == 0:
-                continue
+        if feature in self.categorical_features_:
+            categories = np.unique(values)
+            threshold = self.rng.choice(categories)
+            categorical_split = True
+        else:
+            numeric_values = values.astype(float)
+            threshold = self.rng.uniform(np.min(numeric_values), np.max(numeric_values))
+            categorical_split = False
 
-            return random_feature, threshold
+        return feature, threshold, categorical_split
+    
+    def _prune_node(self, node):
+        node.is_leaf = True
+        node.value = node.depth
+        node.number_of_samples = int(np.sum(node.sub_population))
+        node.left = None
+        node.right = None
+        node.feature = None
+        node.threshold = None
+        return node
+    
+    def predict_one(self, x, node=None, verbose=False, leaf_node=False):
+        if node is None:
+            node = self.root
+
+        if node.value is not None:
+            if leaf_node:
+                return node
+            return node.value
+
+        if node.categorical_split:
+            if x[node.feature] == node.threshold:
+                return self.predict_one(x, node.left, leaf_node=leaf_node)
+            return self.predict_one(x, node.right, leaf_node=leaf_node)
+
+        if float(x[node.feature]) > node.threshold:
+            return self.predict_one(x, node.left, leaf_node=leaf_node)
+
+        return self.predict_one(x, node.right, leaf_node=leaf_node)
+
+    def predict(self, X):
+        if self.vectorized:
+            return self.vectorized_predict_search(X)
+        return np.array([self.predict_one(x) for x in X])
+
+    def vectorized_predict_search(self, X):
+        self._update_bounds()
+        leaves = self.get_leaves()
+        for leaf in leaves:
+            leaf.update_indicator()
+        values = np.array([leaf.value for leaf in leaves], dtype=float)
+        indicators = np.array([leaf.indicator(X) for leaf in leaves], dtype=float)
+        if not np.all(np.sum(indicators, axis=0) == 1):
+            raise RuntimeError("All column sums in the matrix must be equal to 1")
+        return values @ indicators
+
+    def _update_bounds(self):
+        self.root.update_bounds_below()
 
     def get_leaf(self, node, sub_population):
         leaf = ANonSeriousNode()
@@ -2089,6 +2175,34 @@ class ANonSeriousIsolationRandomTree(ANonSeriousDecisionTree):
         leaf.sub_population = sub_population
         leaf.number_of_samples = sum(sub_population)
         return leaf
+    
+    def path_length(self, X):
+        return np.array([self.path_length_one(x) for x in X])
+
+    def path_length_one(self, x, node=None):
+        if node is None:
+            node = self.root
+
+        if node.is_leaf or node.value is not None:
+            return node.depth + self.c(node.number_of_samples)
+
+        if node.categorical_split:
+            if x[node.feature] == node.threshold:
+                return self.path_length_one(x, node.left)
+            return self.path_length_one(x, node.right)
+
+        if float(x[node.feature]) > node.threshold:
+            return self.path_length_one(x, node.left)
+
+        return self.path_length_one(x, node.right)
+    
+    def c(self, n):
+        if n <= 1:
+            return 0.0
+        if n == 2:
+            return 1.0
+        euler_gamma = 0.5772156649
+        return 2.0 * (np.log(n - 1) + euler_gamma) - (2.0 * (n - 1) / n)
     
     @staticmethod
     def visualize_tree(X, min=1, max=9, max_depth=10, cmap=plt.cm.Set1):
@@ -2104,7 +2218,7 @@ class ANonSeriousIsolationRandomTree(ANonSeriousDecisionTree):
             Z = model.predict(np.vstack([XX_flat, YY_flat]).T)
             ax.pcolormesh(XX, YY, Z.reshape([100, 100]), cmap=cmap, shading="auto")
 
-        fig, axes = plt.subplots(3, 3, figsize=(12, 12))
+        fig, axes = plt.subplots(3, 3, figsize=(8, 8))
         plt.subplots_adjust(hspace=0.3, wspace=0.3)
         axes[0, 0].scatter(X[:, 0], X[:, 1])
         axes[0, 0].set_title("a cloud and an outlier")
@@ -2114,15 +2228,196 @@ class ANonSeriousIsolationRandomTree(ANonSeriousDecisionTree):
             visualize_bassins(
                 axes[i % 3, i // 3], T, -1.2, 1.5, -0.5, 0.5, cmap=plt.cm.RdBu
             )
-            axes[i % 3, i // 3].set_title(f"Bassins of the isolation tree for seed={i}")
-        plt.savefig("img/sltn_tr_bassins.png")
+            axes[i % 3, i // 3].set_title(f"Bassins of the isolation tree for seed={i}", fontsize=6)
+        plt.savefig("img/sltn_bassins.png")
         plt.show()
 
-class ANonSeriousIsolationForest:
-    pass
 
 class ANonSeriousIsolationRandomForest:
-    pass
+    
+    def __init__(
+        self, 
+        number_of_trees=100, 
+        max_depth=10, 
+        minimum_population_size=1, 
+        seed=0, 
+        vectorized=False,
+        sample_size=256,
+        categorical=False,
+        categorical_features=None,
+    ):
+        if vectorized and (categorical or categorical_features is not None):
+            raise RuntimeError("Categorical data can't be used for vectorized search")
+        self.number_of_trees = number_of_trees
+        self.max_depth = max_depth
+        self.seed = seed
+        self.vectorized = vectorized
+        self.rng = np.random.default_rng(seed=seed)
+        self.sample_size = sample_size
+        self.minimum_population_size = minimum_population_size
+        self.categorical = categorical
+        self.categorical_features = categorical_features
+    
+    def fit(self, X, verbose=False):
+        self.X_train_ = X
+        self.trees = []
+        
+        number_of_samples = self.X_train_.shape[0]
+        if self.categorical_features is not None:
+            self.categorical_features_ = set(self.categorical_features)
+        elif self.categorical:
+            self.categorical_features_ = set(range(self.X_train_.shape[1]))
+        else:
+            self.categorical_features_ = set()
+        
+        depths = []
+        nodes = []
+        leaves = []
+        
+        for i in range(self.number_of_trees):
+            tree = ANonSeriousIsolationRandomTree(
+                max_depth=self.max_depth,
+                seed=self.seed + i,
+                vectorized=self.vectorized,
+                minimum_population_size=self.minimum_population_size,
+                categorical=self.categorical,
+                categorical_features=self.categorical_features_,
+            )
+            index = self.rng.choice(
+                number_of_samples, 
+                size=min(self.sample_size, number_of_samples), 
+                replace=False
+            )
+            tree.fit(self.X_train_[index])
+            self.trees.append(tree)
+            
+            depths.append(tree.depth())
+            nodes.append(tree.count_nodes())
+            leaves.append(tree.count_nodes(only_leaves=True))
+        if verbose:
+            print(f"""  Training finished.
+    - Mean depth                     : {np.array(depths).mean()}
+    - Mean number of nodes           : {np.array(nodes).mean()}
+    - Mean number of leaves          : {np.array(leaves).mean()}""")
+        
+        return self
+    
+    def predict(self, X):
+        return self.path_length(X)
+
+    def path_length(self, X):
+        paths = np.array([tree.path_length(X) for tree in self.trees])
+        return paths.mean(axis=0)
+
+    def anomaly_score(self, X):
+        average_path = self.path_length(X)
+        normalizer = self.c(min(self.sample_size, self.X_train_.shape[0]))
+        if normalizer == 0:
+            return np.ones(X.shape[0])
+        return 2.0 ** (-average_path / normalizer)
+    
+    def suspects(self, X, number_of_suspects, use_scores=True):
+        if use_scores:
+            scores = self.anomaly_score(X)
+            index = np.argsort(scores)[-number_of_suspects:][::-1]
+            return X[index], scores[index]
+
+        depths = self.path_length(X)
+        index = np.argsort(depths)[:number_of_suspects]
+        return X[index], depths[index]
+        
+    def predict_labels(self, X, contamination=0.01):
+        if not (0 < contamination < 1):
+            raise ValueError("contamination must be between 0 and 1")
+
+        scores = self.anomaly_score(X)
+        threshold = np.quantile(scores, 1.0 - contamination)
+
+        labels = np.ones(X.shape[0], dtype=int)
+        labels[scores >= threshold] = -1
+
+        return labels
+
+    def visualize_tree(
+        self,
+        feature1=0,
+        feature2=1,
+        resolution=100,
+        cmap=plt.cm.RdBu,
+    ):
+        os.makedirs("img", exist_ok=True)
+
+        X_plot = self.X_train_[:, [feature1, feature2]].astype(float)
+
+        x_min, x_max = np.min(X_plot[:, 0]), np.max(X_plot[:, 0])
+        y_min, y_max = np.min(X_plot[:, 1]), np.max(X_plot[:, 1])
+
+        x_margin = 0.05 * (x_max - x_min if x_max > x_min else 1.0)
+        y_margin = 0.05 * (y_max - y_min if y_max > y_min else 1.0)
+
+        x_min -= x_margin
+        x_max += x_margin
+        y_min -= y_margin
+        y_max += y_margin
+
+        xs = np.linspace(x_min, x_max, resolution)
+        ys = np.linspace(y_min, y_max, resolution)
+        XX, YY = np.meshgrid(xs, ys)
+
+        baseline = self._baseline_row()
+        grid_points = np.tile(baseline, (XX.size, 1))
+
+        grid_points[:, feature1] = XX.ravel()
+        grid_points[:, feature2] = YY.ravel()
+
+        Z = self.predict(grid_points).reshape(XX.shape)
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+        axes[0].scatter(X_plot[:, 0], X_plot[:, 1], edgecolors="black")
+        axes[0].set_title("Training points")
+        axes[0].set_xlabel(f"feature {feature1}")
+        axes[0].set_ylabel(f"feature {feature2}")
+
+        mesh = axes[1].pcolormesh(
+            XX,
+            YY,
+            Z,
+            cmap=cmap,
+            shading="auto",
+        )
+        axes[1].scatter(X_plot[:, 0], X_plot[:, 1], edgecolors="black")
+        axes[1].set_title("Average isolation depth")
+        axes[1].set_xlabel(f"feature {feature1}")
+        axes[1].set_ylabel(f"feature {feature2}")
+
+        fig.colorbar(mesh, ax=axes[1], label="average path length")
+
+        plt.tight_layout()
+        plt.savefig("img/sltn_random_forest.png")
+        plt.show()
+    
+    def _baseline_row(self):
+        baseline = np.empty(self.X_train_.shape[1], dtype=object)
+
+        for feature in range(self.X_train_.shape[1]):
+            values = self.X_train_[:, feature]
+
+            if feature in self.categorical_features_:
+                unique_values, counts = np.unique(values, return_counts=True)
+                baseline[feature] = unique_values[np.argmax(counts)]
+            else:
+                baseline[feature] = np.mean(values.astype(float))
+
+        return baseline
+    
+    def c(self, n):
+        if n <= 1:
+            return 0.0
+        if n == 2:
+            return 1.0
+        euler_gamma = 0.5772156649
+        return 2.0 * (np.log(n - 1) + euler_gamma) - (2.0 * (n - 1) / n)
 
 
 if __name__ == "__main__":
@@ -2292,8 +2587,18 @@ if __name__ == "__main__":
     # random_forest.visualize_tree(feature1, feature2)
 
     X_train_, _ = circle_of_clouds(1, 100, sigma=0.2)  # a cloud
-    X_train_[0] = [-1, 0]  # an outlier
+    # X_train_[0] = [-1, 0]  # an outlier
+    # X_train_[1] = [-2, 1]  # an outlier
+    X_train_[2] = [-3, 2]  # an outlier
     
     ANonSeriousIsolationRandomTree.visualize_tree(X_train_)
-
     
+    X_train_, _ = circle_of_clouds(3, 100, sigma=0.2)
+    IRF = ANonSeriousIsolationRandomForest(max_depth=15)
+    IRF.fit(X_train_, verbose=1)
+    suspects, depths = IRF.suspects(X_train_, number_of_suspects=3)
+
+    print("suspects :", suspects)
+    print("depths of suspects :", depths)
+
+    IRF.visualize_tree()
