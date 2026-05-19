@@ -2089,6 +2089,34 @@ class ANonSeriousIsolationRandomTree(ANonSeriousDecisionTree):
         leaf.sub_population = sub_population
         leaf.number_of_samples = sum(sub_population)
         return leaf
+    
+    @staticmethod
+    def visualize_tree(X, min=1, max=9, max_depth=10, cmap=plt.cm.Set1):
+        os.makedirs("img", exist_ok=True)
+            
+        def visualize_bassins(ax, model, x_min, x_max, y_min, y_max, cmap):
+            assert model.X_train_.shape[1] == 2, "Not a 2D example"
+            X = np.linspace(x_min, x_max, 100)
+            Y = np.linspace(y_min, y_max, 100)
+            XX, YY = np.meshgrid(X, Y)
+            XX_flat = XX.ravel()
+            YY_flat = YY.ravel()
+            Z = model.predict(np.vstack([XX_flat, YY_flat]).T)
+            ax.pcolormesh(XX, YY, Z.reshape([100, 100]), cmap=cmap, shading="auto")
+
+        fig, axes = plt.subplots(3, 3, figsize=(12, 12))
+        plt.subplots_adjust(hspace=0.3, wspace=0.3)
+        axes[0, 0].scatter(X[:, 0], X[:, 1])
+        axes[0, 0].set_title("a cloud and an outlier")
+        for i in range(min, max):
+            T = ANonSeriousIsolationRandomTree(max_depth=max_depth, seed=i)
+            T.fit(X)
+            visualize_bassins(
+                axes[i % 3, i // 3], T, -1.2, 1.5, -0.5, 0.5, cmap=plt.cm.RdBu
+            )
+            axes[i % 3, i // 3].set_title(f"Bassins of the isolation tree for seed={i}")
+        plt.savefig("img/sltn_tr_bassins.png")
+        plt.show()
 
 class ANonSeriousIsolationForest:
     pass
@@ -2263,51 +2291,9 @@ if __name__ == "__main__":
 
     # random_forest.visualize_tree(feature1, feature2)
 
-    def np_extrema(arr):
-        return np.min(arr), np.max(arr)
-
-    def visualize_bassins(ax, model, x_min, x_max, y_min, y_max, cmap):
-        assert model.X_train_.shape[1] == 2, "Not a 2D example"
-        X = np.linspace(x_min, x_max, 100)
-        Y = np.linspace(y_min, y_max, 100)
-        XX, YY = np.meshgrid(X, Y)
-        XX_flat = XX.ravel()
-        YY_flat = YY.ravel()
-        Z = model.predict(np.vstack([XX_flat, YY_flat]).T)
-        ax.pcolormesh(XX, YY, Z.reshape([100, 100]), cmap=cmap, shading="auto")
-
-    def visualize_training_dataset_2D(ax, model, cmap):
-        ax.scatter(
-            model.X_train_[:, 0], model.X_train_[:, 1], c=model.target, cmap=cmap
-        )
-
-    def visualize_model_2D(model, cmap=plt.cm.Set1):
-        assert model.X_train_.shape[1] == 2, "Not a 2D example"
-
-        x_min, x_max = np_extrema(model.X_train_[:, 0])
-        y_min, y_max = np_extrema(model.X_train_[:, 1])
-        fig, axes = plt.subplots(1, 2, figsize=(15, 7))
-        for ax in axes:
-            ax.set_xlim(x_min, x_max)
-            ax.set_ylim(y_min, y_max)
-        visualize_training_dataset_2D(axes[0], model, cmap)
-        visualize_bassins(axes[1], model, x_min, x_max, y_min, y_max, cmap)
-        plt.savefig("bassins3.png")
-        plt.show()
-
     X_train_, _ = circle_of_clouds(1, 100, sigma=0.2)  # a cloud
     X_train_[0] = [-1, 0]  # an outlier
+    
+    ANonSeriousIsolationRandomTree.visualize_tree(X_train_)
 
-    fig, axes = plt.subplots(3, 3, figsize=(12, 12))
-    plt.subplots_adjust(hspace=0.3, wspace=0.3)
-    axes[0, 0].scatter(X_train_[:, 0], X_train_[:, 1])
-    axes[0, 0].set_title("a cloud and an outlier")
-    for i in range(1, 9):
-        T = ANonSeriousIsolationRandomTree(max_depth=8, seed=i)
-        T.fit(X_train_)
-        visualize_bassins(
-            axes[i % 3, i // 3], T, -1.2, 1.5, -0.5, 0.5, cmap=plt.cm.RdBu
-        )
-        axes[i % 3, i // 3].set_title(f"bassins of isolation tree for seed={i}")
-    plt.savefig("bassins3.png")
-    plt.show()
+    
