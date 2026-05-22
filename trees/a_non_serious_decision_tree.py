@@ -732,7 +732,7 @@ class ANonSeriousDecisionTree:
         return float(thresholds[result]), float(__weighted_average[result])
 
     def random_split_criterion(self, features, X):
-        while True:
+        for _ in range(X.shape[1]):
             random_feature = self.rng.choice(features, size=1, replace=False)[0]
 
             values = X[:, random_feature]
