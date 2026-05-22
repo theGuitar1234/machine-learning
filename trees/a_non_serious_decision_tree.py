@@ -532,9 +532,9 @@ class ANonSeriousDecisionTree:
         if self.random_criterion is not None:
             match self.random_criterion:
                 case self.RandomCriterion.RANDOM_FEATURE:
-                    features = self.random_feature_criterion(self, number_of_features)
+                    features = self.random_feature_criterion(features, number_of_features)
                 case self.RandomCriterion.RANDOM_SPLIT:
-                    return self.random_split_criterion(features)
+                    return self.random_split_criterion(features, X)
                 case _:
                     raise ValueError(
                         f"Unsupported {self.random_criterion}, supported values are {list(self.RandomCriterion)}"
@@ -753,7 +753,7 @@ class ANonSeriousDecisionTree:
 
             return random_feature, threshold
     
-    def random_feature_criterion(self, number_of_features):
+    def random_feature_criterion(self, features, number_of_features):
         max_feature_method = None
         match self.max_features:
             case self.MaxFeatures.SQRT:
@@ -767,11 +767,11 @@ class ANonSeriousDecisionTree:
                     f"Unsupported {self.max_features}, supported values are {list(self.MaxFeatures)}"
                 )
         ratio_size = self.max_features_ratio * number_of_features
-        number_of_features = (
-            ratio_size
-            if ratio_size <= number_of_features
-            else number_of_features
-        )
+        # number_of_features = (
+        #     ratio_size
+        #     if ratio_size <= number_of_features
+        #     else number_of_features
+        # )
         number_of_features = (
             number_of_features
             if number_of_features <= self.max_number_of_features
@@ -781,10 +781,10 @@ class ANonSeriousDecisionTree:
         candidate_count = max(
             1, int(max_feature_method(number_of_features))
         )
-        features = self.rng.choice(
+        _features = self.rng.choice(
             features, size=candidate_count, replace=False
         )
-        return features
+        return _features
 
     def mse(self, y, y_hat):
         return np.mean((y - y_hat) ** 2)
@@ -2453,23 +2453,23 @@ if __name__ == "__main__":
             target(),
         )
 
-    # dataset = datasets.load_iris()
+    dataset = datasets.load_iris()
     seed = np.random.randint(0, 100)
 
-    # X, y = ANonSeriousDecisionTree.circle_of_clouds(10, 30, seed=seed)
+    # X, y = circle_of_clouds(10, 30, seed=seed)
     feature1 = 0
     feature2 = 1
 
-    # X = dataset.data[:, [feature_x, feature_y]]
-    # X = dataset.data
-    # y = dataset.target
+    X = dataset.data[:, [feature1, feature2]]
+    X = dataset.data
+    y = dataset.target
 
-    X, y = make_regression(
-        n_samples=300,
-        n_features=2,
-        noise=15,
-        random_state=seed,
-    )
+    # X, y = make_regression(
+    #     n_samples=300,
+    #     n_features=2,
+    #     noise=15,
+    #     random_state=seed,
+    # )
 
     X_train_val, X_test, y_train_val, y_test = train_test_split(
         X,
@@ -2503,10 +2503,10 @@ if __name__ == "__main__":
     # # print("\nPruning the tree...")
     # # final_tree.prune_minimum_error()
 
-    # print(
-    #     "After pruning Validation Accuracy:",
-    #     final_tree.evaluate_dataset(X_val, y_val)[1],
-    # )
+    # # print(
+    # #     "After pruning Validation Accuracy:",
+    # #     final_tree.evaluate_dataset(X_val, y_val)[1],
+    # # )
     # print(
     #     "Final test accuracy:",
     #     final_tree.evaluate_dataset(X_test, y_test)[1],
@@ -2515,16 +2515,16 @@ if __name__ == "__main__":
     # tree_str = str(final_tree)
     # print(f"\n{tree_str}")
 
-    # # tree_vis = final_tree.export_text(
-    # #     final_tree.root,
-    # #     feature_names=dataset.feature_names,
-    # #     class_names=dict(zip(np.unique(dataset.target), dataset.target_names)),
-    # # )
-    # tree_vis = final_tree.export_text(final_tree.root)
+    # tree_vis = final_tree.export_text(
+    #     final_tree.root,
+    #     feature_names=dataset.feature_names,
+    #     class_names=dict(zip(np.unique(dataset.target), dataset.target_names)),
+    # )
+    # # tree_vis = final_tree.export_text(final_tree.root)
     # print(f"{tree_vis}")
 
-    # # final_tree.permutation_importance(X_test, y_test, dataset.feature_names)
-    # final_tree.permutation_importance(X_test, y_test, verbose=True)
+    # final_tree.permutation_importance(X_test, y_test, dataset.feature_names)
+    # # final_tree.permutation_importance(X_test, y_test, verbose=True)
 
     # final_tree.visualize_tree(feature1, feature2)
 
@@ -2560,9 +2560,9 @@ if __name__ == "__main__":
     # print("\nInitializing a Random Forest...")
     # random_forest = ANonSeriousRandomForest(
     #     information_gain=ANonSeriousDecisionTree.InformationGain.GINI,
-    #     random_criterion=ANonSeriousDecisionTree.RandomCriterion.RANDOM_FEATURE,
-    #     _bootstrap=True,
-    #     forest_type=ANonSeriousRandomForest.ForestType.REGRESSION,
+    #     random_criterion=ANonSeriousDecisionTree.RandomCriterion.RANDOM_SPLIT,
+    #     _bootstrap=False,
+    #     forest_type=ANonSeriousRandomForest.ForestType.CLASSIFICATION,
     #     voting=ANonSeriousRandomForest.Voting.SOFT,
     # )
 
@@ -2587,8 +2587,8 @@ if __name__ == "__main__":
     # random_forest.visualize_tree(feature1, feature2)
 
     X_train_, _ = circle_of_clouds(1, 100, sigma=0.2)  # a cloud
-    # X_train_[0] = [-1, 0]  # an outlier
-    # X_train_[1] = [-2, 1]  # an outlier
+    X_train_[0] = [-1, 0]  # an outlier
+    X_train_[1] = [-2, 1]  # an outlier
     X_train_[2] = [-3, 2]  # an outlier
     
     ANonSeriousIsolationRandomTree.visualize_tree(X_train_)
