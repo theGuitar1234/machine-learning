@@ -19,7 +19,7 @@ import numpy as np
 import copy
 import math
 
-from a_non_serious_decision_tree import ANonSeriousDecisionTree
+from .a_non_serious_decision_tree import ANonSeriousDecisionTree
 
 
 class ANonSeriousRandomForest:

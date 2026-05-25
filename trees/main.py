@@ -1,8 +1,8 @@
-from a_non_serious_node import ANonSeriousNode
-from a_non_serious_decision_tree import ANonSeriousDecisionTree
-from a_non_serious_random_forest import ANonSeriousRandomForest
-from a_non_serious_isolation_random_tree import ANonSeriousIsolationRandomTree
-from a_non_serious_isolation_random_forest import ANonSeriousIsolationRandomForest
+from .a_non_serious_node import ANonSeriousNode
+from .a_non_serious_decision_tree import ANonSeriousDecisionTree
+from .a_non_serious_random_forest import ANonSeriousRandomForest
+from .a_non_serious_isolation_random_tree import ANonSeriousIsolationRandomTree
+from .a_non_serious_isolation_random_forest import ANonSeriousIsolationRandomForest
 
 from dataclasses import dataclass
 from enum import Enum

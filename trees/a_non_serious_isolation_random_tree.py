@@ -19,7 +19,7 @@ import numpy as np
 import copy
 import math
 
-from a_non_serious_node import ANonSeriousNode
+from .a_non_serious_node import ANonSeriousNode
 
 
 class ANonSeriousIsolationRandomTree:
