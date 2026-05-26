@@ -1,11 +1,18 @@
+from enum import Enum
+
 from sklearn import datasets
 import numpy as np
+from sklearn.model_selection import train_test_split
 from trees import ANonSeriousDecisionTree
 import matplotlib.pyplot as plt
 import os
 
 
 class GradientBoosting:
+    
+    class LossType(Enum):
+        BINARY_CROSS_ENTROPY = 1
+        SSE = 2
 
     def __init__(
         self,
@@ -19,6 +26,11 @@ class GradientBoosting:
         information_gain=0.01,
         random_criterion=None,
         tree_type=ANonSeriousDecisionTree.TreeType.REGRESSION,
+        loss_type=None,
+        sub_sample=0.8,
+        column_sub_sample=1,
+        early_stopping=False,
+        restore_best=False,
     ):
         self.boosting_rounds = boosting_rounds
         self.learning_rate = learning_rate
@@ -30,18 +42,35 @@ class GradientBoosting:
         self.information_gain = information_gain
         self.random_criterion = random_criterion
         self.tree_type = tree_type
+        self.loss_type = loss_type
+        self.sub_sample = sub_sample
+        self.column_sub_sample = column_sub_sample
+        self.early_stopping = early_stopping
+        self.restore_best = restore_best
 
-    def fit(self, X, y):
+    def fit(self, X, y, X_val, y_val):
         self.X_train_ = X
         self.y_train_ = y
         
         self.trees = []
+        self.feature_indices = []
 
         self.F_0x = np.mean(y)
         self.F_x = np.repeat(self.F_0x, y.shape[0])
+        
+        number_of_samples = X.shape[0]
+        number_of_features = X.shape[1]
+        sample_size = int(self.sub_sample * number_of_samples)
+        number_of_selected_features = int(self.column_sub_sample * number_of_features)
 
-        for _ in range(self.boosting_rounds):
+        best_val_loss = float("inf")
+        patience = 100
+        best_epoch = -1
+        best_number_of_trees = 0
+        patience_counter = 0
+        for epoch in range(self.boosting_rounds):
             pseudo_residual = -self.dloss(y, self.F_x)
+
             tree = ANonSeriousDecisionTree(
                 max_depth=self.max_depth,
                 minimum_population_size=self.minimum_population_size,
@@ -52,24 +81,91 @@ class GradientBoosting:
                 random_criterion=self.random_criterion,
                 tree_type=self.tree_type,
             )
-            tree.fit(X, pseudo_residual)
+            
+            indices = np.random.choice(number_of_samples, size=sample_size, replace=False)
+            feature_indices = np.random.choice(number_of_features, size=number_of_selected_features, replace=False)
+            
+            X_sub = X[indices][:, feature_indices]
+            pseudo_residual_sub = pseudo_residual[indices]
+            
+            tree.fit(X_sub, pseudo_residual_sub)
+            
             self.trees.append(tree)
-
-            self.F_x += self.learning_rate * tree.predict(X)
+            self.feature_indices.append(feature_indices)
+            self.F_x += self.learning_rate * tree.predict(X[:, feature_indices])
+            
+            _, val_loss = self.evaluate_dataset(X_val, y_val)
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_epoch = epoch
+                patience_counter = 0
+                best_number_of_trees = len(self.trees)
+            else:
+                patience_counter += 1
+            if self.early_stopping and patience_counter >= patience:
+                print("Overfitting detected. Early stopping at epoch: ", epoch, "Best Epoch : ", best_epoch)
+                break
+        if self.restore_best:
+            self.trees = self.trees[:best_number_of_trees]
+            self.feature_indices = self.feature_indices[:best_number_of_trees]
+            self.F_x = np.repeat(self.F_0x, X.shape[0])
+            for tree, feature_indices in zip(self.trees, self.feature_indices):
+                self.F_x += self.learning_rate * tree.predict(X[:, feature_indices])
         return self
-
-    def loss(self, y, F_x):
-        return 1 / 2 * (y - F_x) ** 2
-
+    
     def dloss(self, y, F_x):
-        return F_x - y
+        match self.loss_type:
+            case self.LossType.BINARY_CROSS_ENTROPY:
+                p_x = self.sigmoid(F_x)
+                return y - p_x
+            case self.LossType.SSE:
+                return F_x - y
+            case _:
+                raise ValueError(f"Unsupported {self.LossType}, supported values are {list(self.LossType)}")
+
+    def sse(self, y, F_x):
+        return np.mean(1 / 2 * (y - F_x) ** 2)
+
+    def sigmoid(self, z):
+        z = np.asarray(z, dtype=float)
+        out = np.empty_like(z)
+
+        pos = z >= 0
+        neg = ~pos
+
+        out[pos] = 1.0 / (1.0 + np.exp(-z[pos]))
+        ez = np.exp(z[neg])
+        out[neg] = ez / (1.0 + ez)
+
+        return out
+    
+    def binary_cross_entropy_loss(self, y, F_x, epsilon=1e-12):
+        p_x = self.sigmoid(F_x)
+        m = y.shape[0]
+        p_x = np.clip(p_x, epsilon, 1.0 - epsilon)
+        return -np.sum(y * np.log(p_x) + (1 - y) * np.log(1 - p_x)) / m
+
+    def evaluate_dataset(self, X, y):
+        if y.ndim == 2:
+            y = np.argmax(y, axis=1)
+        F_x = self.predict(X) 
+        predictions = np.asarray(F_x)
+        loss = None
+        match self.loss_type:
+            case self.LossType.BINARY_CROSS_ENTROPY:
+                loss = self.binary_cross_entropy_loss(y, F_x)
+            case self.LossType.SSE:
+                loss = self.sse(y, F_x)
+            case _:
+                raise ValueError(f"Unsupported {self.LossType}, supported values are {list(self.LossType)}")
+        return predictions, loss
 
     def predict(self, X):
         if self.F_0x is None:
             raise RuntimeError("Model is not fit")
         prediction = np.repeat(self.F_0x, X.shape[0])
-        for tree in self.trees:
-            prediction += self.learning_rate * tree.predict(X)
+        for tree, feature_indices in zip(self.trees, self.feature_indices):
+            prediction += self.learning_rate * tree.predict(X[:, feature_indices])
         return prediction
     
     def visualize(self):
@@ -175,8 +271,20 @@ if __name__ == "__main__":
         noise=15,
         random_state=42,
     )
+    
+    X_train, X_val, y_train, y_val = train_test_split(
+        X,
+        y,
+        test_size=0.25,
+        random_state=42,
+        # stratify=y_train_val
+    )
 
-    gradient_boost = GradientBoosting()
-    gradient_boost.fit(X, y)
+    gradient_boost = GradientBoosting(
+        loss_type=GradientBoosting.LossType.SSE,
+        restore_best=True,
+        early_stopping=True
+    )
+    gradient_boost.fit(X_train, y_train, X_val, y_val)
     
     gradient_boost.visualize()
