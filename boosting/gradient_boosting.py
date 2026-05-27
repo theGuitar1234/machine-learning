@@ -48,27 +48,35 @@ class GradientBoosting:
         self.early_stopping = early_stopping
         self.restore_best = restore_best
 
-    def fit(self, X, y, X_val, y_val):
+    def fit(self, X, y, X_val, y_val, epsilon=1e-12):
         self.X_train_ = X
         self.y_train_ = y
         
         self.trees = []
         self.feature_indices = []
 
-        self.F_0x = np.mean(y)
+        match self.loss_type:
+            case self.LossType.BINARY_CROSS_ENTROPY:
+                p0 = np.clip(np.mean(y), epsilon, 1 - epsilon)
+                self.F_0x = np.log(p0 / (1 - p0))
+            case self.LossType.SSE:
+                self.F_0x = np.mean(y)
+            case _:
+                raise ValueError(f"Unsupported {self.LossType}, supported values are {list(self.LossType)}")
+
         self.F_x = np.repeat(self.F_0x, y.shape[0])
         
         number_of_samples = X.shape[0]
         number_of_features = X.shape[1]
-        sample_size = int(self.sub_sample * number_of_samples)
-        number_of_selected_features = int(self.column_sub_sample * number_of_features)
+        sample_size = max(1, int(self.sub_sample * number_of_samples))
+        number_of_selected_features = max(1, int(self.column_sub_sample * number_of_features))
 
         best_val_loss = float("inf")
         patience = 100
-        best_epoch = -1
+        best_round = -1
         best_number_of_trees = 0
         patience_counter = 0
-        for epoch in range(self.boosting_rounds):
+        for round in range(self.boosting_rounds):
             pseudo_residual = -self.dloss(y, self.F_x)
 
             tree = ANonSeriousDecisionTree(
@@ -90,6 +98,8 @@ class GradientBoosting:
             
             tree.fit(X_sub, pseudo_residual_sub)
             
+            self.leaf_correction(tree, X_sub, y[indices], self.F_x[indices])
+            
             self.trees.append(tree)
             self.feature_indices.append(feature_indices)
             self.F_x += self.learning_rate * tree.predict(X[:, feature_indices])
@@ -97,13 +107,13 @@ class GradientBoosting:
             _, val_loss = self.evaluate_dataset(X_val, y_val)
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                best_epoch = epoch
+                best_round = round
                 patience_counter = 0
                 best_number_of_trees = len(self.trees)
             else:
                 patience_counter += 1
             if self.early_stopping and patience_counter >= patience:
-                print("Overfitting detected. Early stopping at epoch: ", epoch, "Best Epoch : ", best_epoch)
+                print("Overfitting detected. Early stopping at round: ", round, "Best Round : ", best_round)
                 break
         if self.restore_best:
             self.trees = self.trees[:best_number_of_trees]
@@ -117,7 +127,7 @@ class GradientBoosting:
         match self.loss_type:
             case self.LossType.BINARY_CROSS_ENTROPY:
                 p_x = self.sigmoid(F_x)
-                return y - p_x
+                return p_x - y
             case self.LossType.SSE:
                 return F_x - y
             case _:
@@ -144,6 +154,34 @@ class GradientBoosting:
         m = y.shape[0]
         p_x = np.clip(p_x, epsilon, 1.0 - epsilon)
         return -np.sum(y * np.log(p_x) + (1 - y) * np.log(1 - p_x)) / m
+    
+    def leaf_correction(self, tree, X, y, F):
+        leaf_to_indices = {}
+        for i, x in enumerate(X):
+            leaf = tree.predict_one(x, leaf_node=True)
+            leaf_id = id(leaf)
+            if leaf_id not in leaf_to_indices:
+                leaf_to_indices[leaf_id] = {
+                    "leaf": leaf,
+                    "indices": []
+                }
+            leaf_to_indices[leaf_id]["indices"].append(i)
+        for item in leaf_to_indices.values():
+            leaf = item["leaf"]
+            index = np.array(item["indices"])
+            y_leaf = y[index]
+            F_leaf = F[index]
+            leaf.value = self._correct(y_leaf, F_leaf)
+    
+    def _correct(self, y, F, epsilon=1e-12):
+        match self.loss_type:
+            case self.LossType.SSE:
+                return np.mean(y - F)
+            case self.LossType.BINARY_CROSS_ENTROPY:
+                p = self.sigmoid(F)
+                return np.sum(y - p) / (np.sum(p * (1 - p)) + epsilon)
+            case _:
+                raise ValueError(f"Unsupported {self.LossType}, supported values are {list(self.LossType)}")
 
     def evaluate_dataset(self, X, y):
         if y.ndim == 2:
@@ -207,8 +245,8 @@ class GradientBoosting:
         initial_mse = np.mean((y - current_pred) ** 2)
         losses.append(initial_mse)
 
-        for tree in self.trees:
-            current_pred += self.learning_rate * tree.predict(X)
+        for tree, feature_indices in zip(self.trees, self.feature_indices):
+            current_pred += self.learning_rate * tree.predict(X[:, feature_indices])
             mse = np.mean((y - current_pred) ** 2)
             losses.append(mse)
 
