@@ -32,6 +32,10 @@ class GradientBoosting:
         early_stopping=False,
         restore_best=False,
     ):
+        if sub_sample%1 != 0 or column_sub_sample%1 != 0:
+            raise ValueError("sub_sample and column_sub_sample must be a positive fraction less than 1")
+        self.sub_sample = sub_sample
+        self.column_sub_sample = column_sub_sample
         self.boosting_rounds = boosting_rounds
         self.learning_rate = learning_rate
         self.max_depth = max_depth
@@ -43,8 +47,6 @@ class GradientBoosting:
         self.random_criterion = random_criterion
         self.tree_type = tree_type
         self.loss_type = loss_type
-        self.sub_sample = sub_sample
-        self.column_sub_sample = column_sub_sample
         self.early_stopping = early_stopping
         self.restore_best = restore_best
 
@@ -134,7 +136,7 @@ class GradientBoosting:
                 raise ValueError(f"Unsupported {self.LossType}, supported values are {list(self.LossType)}")
 
     def sse(self, y, F_x):
-        return np.mean(1 / 2 * (y - F_x) ** 2)
+        return 1 / 2 * (y - F_x) ** 2
 
     def sigmoid(self, z):
         z = np.asarray(z, dtype=float)
@@ -207,7 +209,11 @@ class GradientBoosting:
         return prediction
     
     def visualize(self):
+        if self.X_train_ or self.y_train_ is None:
+            raise RuntimeError("Model is not fit")
         os.makedirs("img", exist_ok=True)
+        X = self.X_train_
+        y = self.y_train_
         y_pred = self.predict(X)
 
         plt.figure(figsize=(7, 5))
