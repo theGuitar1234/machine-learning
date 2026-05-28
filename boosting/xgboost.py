@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from enum import Enum
 
 from sklearn import datasets
@@ -13,6 +14,13 @@ class XGBoost:
     class LossType(Enum):
         BINARY_CROSS_ENTROPY = 1
         SSE = 2
+    
+    @dataclass
+    class TrainDefaults:
+        epsilon: float = 1e-12
+        l2: float = 0.5
+        gamma: float = 0.2
+        threshold: float = 0.5
 
     def __init__(
         self,
@@ -31,11 +39,14 @@ class XGBoost:
         column_sub_sample=1,
         early_stopping=False,
         restore_best=False,
+        config=None,
     ):
-        if (0 < sub_sample <= 1) or (0 < column_sub_sample <= 1):
+        if not (0 < sub_sample <= 1) or not (0 < column_sub_sample <= 1):
             raise ValueError(
                 "sub_sample and column_sub_sample must be a positive fraction less than 1"
             )
+        if config is None:
+            config = self.TrainDefaults()
         self.sub_sample = sub_sample
         self.column_sub_sample = column_sub_sample
         self.boosting_rounds = boosting_rounds
@@ -52,12 +63,14 @@ class XGBoost:
         self.early_stopping = early_stopping
         self.restore_best = restore_best
 
-    def fit(self, X, y, X_val, y_val, epsilon=1e-12):
+    def fit(self, X, y, X_val, y_val):
         self.X_train_ = X
         self.y_train_ = y
 
         self.trees = []
         self.feature_indices = []
+        
+        epsilon = self.config.epsilon
 
         match self.loss_type:
             case self.LossType.BINARY_CROSS_ENTROPY:
@@ -97,9 +110,16 @@ class XGBoost:
                 tree_type=self.tree_type,
             )
 
-            loss = self.dloss(y, self.F_x)
-            pseudo_residual = -loss
-            total_loss += loss
+            pseudo_residual = -self.dloss(y, self.F_x)
+            match self.loss_type:
+                case self.LossType.SSE:
+                    total_loss += self.sse(y, self.F_x)
+                case self.LossType.BINARY_CROSS_ENTROPY:
+                    total_loss += self.binary_cross_entropy_loss(y, self.F_x)
+                case _:
+                    raise ValueError(
+                        f"Unsupported {self.LossType}, supported values are {list(self.LossType)}"
+                    )
 
             indices = np.random.choice(
                 number_of_samples, size=sample_size, replace=False
@@ -112,16 +132,14 @@ class XGBoost:
             pseudo_residual_sub = pseudo_residual[indices]
 
             tree.fit(X_sub, pseudo_residual_sub)
-            
-            leaves = tree.get_leaves()
-            number_of_leaves = len(leaves)
-            leaf_scores = self.get_leaf_scores(tree, X)
 
             self.leaf_correction(tree, X_sub, y[indices], self.F_x[indices])
 
             self.trees.append(tree)
             self.feature_indices.append(feature_indices)
             self.F_x += self.learning_rate * tree.predict(X[:, feature_indices])
+            
+            self.tree_complexity_penalty(total_loss)
 
             _, val_loss = self.evaluate_dataset(X_val, y_val)
             if val_loss < best_val_loss:
@@ -159,11 +177,19 @@ class XGBoost:
                     f"Unsupported {self.LossType}, supported values are {list(self.LossType)}"
                 )
 
-    def tree_complexity_penalty(self, number_of_leaves, leaf_scores, gamma=0.5, l2=0.2):
-        return gamma * number_of_leaves + 1 / 2 * l2 * leaf_scores**2
+    def tree_complexity_penalty(self, loss):
+        gamma = self.config.gamma
+        l2 = self.config.l2
 
-    def get_leaf_scores(self, tree, X):
-        return np.asarray([tree.predict_one(x, leaf_node=True).value for x in X])
+        complexity = 0
+        for tree in self.trees:
+            number_of_leaves = len(tree.get_leaves())
+            leaf_scores = self.get_leaf_scores(tree)
+            complexity += gamma * number_of_leaves + 1 / 2 * l2 * np.sum(leaf_scores**2)
+        return loss + complexity
+
+    def get_leaf_scores(self, tree):
+        return np.unique(np.asarray([leaf.value for leaf in tree.get_leaves()]))
 
     def sse(self, y, F_x):
         return 1 / 2 * (y - F_x) ** 2
@@ -187,7 +213,9 @@ class XGBoost:
 
         return out
 
-    def binary_cross_entropy_loss(self, y, F_x, epsilon=1e-12):
+    def binary_cross_entropy_loss(self, y, F_x):
+        epsilon = self.config.epsilon
+
         p_x = self.sigmoid(F_x)
         m = y.shape[0]
         p_x = np.clip(p_x, epsilon, 1.0 - epsilon)
@@ -195,6 +223,7 @@ class XGBoost:
 
     def leaf_correction(self, tree, X, y, F):
         leaf_to_indices = {}
+        number_of_leaves = len(tree.get_leaves())
         for i, x in enumerate(X):
             leaf = tree.predict_one(x, leaf_node=True)
             leaf_id = id(leaf)
@@ -206,15 +235,17 @@ class XGBoost:
             index = np.array(item["indices"])
             y_leaf = y[index]
             F_leaf = F[index]
-            leaf.value = self._correct(y_leaf, F_leaf)
+            leaf.value = self._correct(y_leaf, F_leaf, number_of_leaves)
 
-    def _correct(self, y, F, epsilon=1e-12):
+    def _correct(self, y, F, number_of_leaves):
+        l2 = self.config.l2
+
         match self.loss_type:
             case self.LossType.SSE:
-                return np.mean(y - F)
+                return np.sum(y - F) / (number_of_leaves + l2)
             case self.LossType.BINARY_CROSS_ENTROPY:
                 p = self.sigmoid(F)
-                return np.sum(y - p) / (np.sum(p * (1 - p)) + epsilon)
+                return np.sum(y - p) / (np.sum(p * (1 - p)) + l2)
             case _:
                 raise ValueError(
                     f"Unsupported {self.LossType}, supported values are {list(self.LossType)}"
@@ -238,7 +269,7 @@ class XGBoost:
         return predictions, loss
 
     def predict(self, X):
-        prediction = np.repeat(self.F_0x, X.shape[0].astype(float))
+        prediction = np.repeat(self.F_0x, X.shape[0])
         for tree, feature_indices in zip(self.trees, self.feature_indices):
             prediction += self.learning_rate * tree.predict(X[:, feature_indices])
         return prediction
@@ -246,7 +277,8 @@ class XGBoost:
     def predict_proba(self, X):
         return self.sigmoid(self.predict(X))
 
-    def predict_class(self, X, threshold=0.5):
+    def predict_class(self, X):
+        threshold = self.config.threshold
         return (self.predict_proba(X) >= threshold).astype(int)
 
     def visualize(self):
