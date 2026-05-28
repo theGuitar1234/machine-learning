@@ -12,11 +12,12 @@ def relu(z):
     return max(0, z)
 
 def sigmoid(z):
-    e = 2.7182818459
+    e = 2.718281828459
+    pi = 3.14159265359
     return 1 / (1 + e**-z)
 
 def soft_max(Z):   
-    e = 2.7182818459
+    e = 2.718281828459
     result = [0 for _ in range(len(Z))] 
     sum = 0
     m = max(Z)
