@@ -53,6 +53,7 @@ class ANonSeriousDecisionTree:
     @dataclass
     class TrainDefaults:
         epsilon: float = 1e-5
+        l2: float = 0.5
 
     def __init__(
         self,
@@ -74,9 +75,12 @@ class ANonSeriousDecisionTree:
         error=Error.MSE,
         vectorized=False,
         config=TrainDefaults(),
+        xgboost=False,
     ):
         if categorical and vectorized:
             raise RuntimeError("Categorical data can't be used for vectorized search")
+        if xgboost and tree_type is not self.TreeType.REGRESSION:
+            raise RuntimeError("XGBoost uses Regression Trees")
         self.rng = np.random.default_rng(seed)
         self.root = None
         self.max_depth = max_depth
@@ -99,6 +103,7 @@ class ANonSeriousDecisionTree:
         self.vectorized = vectorized
         self.categorical = categorical
         self.config = config
+        self.xgboost = xgboost
 
     def __str__(self):
         return str(self.root)
@@ -136,7 +141,17 @@ class ANonSeriousDecisionTree:
         _node.sub_population = sub_population
         return _node
 
-    def fit(self, X, y, verbose=False, node=False):
+    def fit(
+        self,
+        X,
+        y,
+        verbose=False,
+        node=False,
+        gradient=None,
+        hessian=None,
+        l2=None,
+        gamma=None,
+    ):
         if y.ndim == 2:
             y = np.argmax(y, axis=1)
         if X.shape[0] != y.shape[0]:
@@ -148,14 +163,24 @@ class ANonSeriousDecisionTree:
         self.classes_, class_counts = np.unique(y, return_counts=True)
         self.class_priors_ = class_counts / len(y)
 
+        if self.xgboost and (
+            gradient is None or hessian is None or l2 is None or gamma is None
+        ):
+            raise RuntimeError(
+                "XGBoost requires the first and second order derivatives and lambda/gamma"
+            )
+        if self.xgboost:
+            self.l2 = l2
+            self.gamma = gamma
+
         if node:
             self.root = ANonSeriousNode()
             self.root.is_root = True
             self.root.depth = 0
             self.root.sub_population = np.ones(self.X_train_.shape[0], dtype=bool)
-            self.fit_node(self.root)
+            self.fit_node(self.root, gradient, hessian)
         else:
-            self.root = self._build_tree(X, y, depth=0)
+            self.root = self._build_tree(X, y, depth=0, gradient=gradient, hessian=hessian)
 
         if verbose:
             number_of_leaves = self.count_nodes(only_leaves=True)
@@ -185,7 +210,7 @@ class ANonSeriousDecisionTree:
 
         return self
 
-    def _build_tree(self, X, y, depth):
+    def _build_tree(self, X, y, depth, gradient=None, hessian=None):
         node = ANonSeriousNode()
         if not self.is_root_set:
             node.is_root = True
@@ -198,22 +223,35 @@ class ANonSeriousDecisionTree:
                 node.majority_class = self._majority_class(y)
                 node.value = None
             case self.TreeType.REGRESSION:
-                node.value = np.mean(y)
+                if self.xgboost and (gradient is not None and hessian is not None):
+                    node.value = -np.sum(gradient) / (
+                        np.sum(hessian) + self.l2
+                    )
+                else:
+                    node.value = np.mean(y)
         node.number_of_samples = len(y)
         _, node.leaf_error = self._leaf_error(y)
         node.number_of_classes = self._class_counts(y)
+        
+        if self.xgboost and (gradient is not None and hessian is not None):
+            node.gradient = gradient
+            node.hessian = hessian
 
         if (
             depth >= self.max_depth
-            or len(set(y)) == 1
             or len(y) <= self.minimum_population_size
-        ):
+        ) or (not self.xgboost and len(set(y)) == 1):
             node.is_leaf = True
             match self.tree_type:
                 case self.TreeType.CLASSIFICATION:
                     node.value = self._majority_class(y)
                 case self.TreeType.REGRESSION:
-                    node.value = np.mean(y)
+                    if self.xgboost and (gradient is not None or hessian is not None):
+                        node.value = -np.sum(gradient) / (
+                            np.sum(hessian) + self.l2
+                        )
+                    else:
+                        node.value = np.mean(y)
                 case _:
                     raise ValueError(
                         f"Unsupported {self.tree_type}, supported values are {list(self.TreeType)}"
@@ -224,7 +262,7 @@ class ANonSeriousDecisionTree:
             case self.TreeType.CLASSIFICATION:
                 feature, threshold = self._classification_split(X, y)
             case self.TreeType.REGRESSION:
-                feature, threshold = self._regression_split(X, y)
+                feature, threshold = self._regression_split(X, y, gradient, hessian)
             case _:
                 raise ValueError(
                     f"Unsupported {self.tree_type}, supported values are {list(self.TreeType)}"
@@ -241,7 +279,12 @@ class ANonSeriousDecisionTree:
                 case self.TreeType.CLASSIFICATION:
                     node.value = self._majority_class(y)
                 case self.TreeType.REGRESSION:
-                    node.value = np.mean(y)
+                    if self.xgboost and (gradient is not None or hessian is not None):
+                        node.value = -np.sum(gradient) / (
+                            np.sum(hessian) + self.l2
+                        )
+                    else:
+                        node.value = np.mean(y)
                 case _:
                     raise ValueError(
                         f"Unsupported {self.TreeType}, supported values are {list(self.TreeType)}"
@@ -267,19 +310,24 @@ class ANonSeriousDecisionTree:
                 case self.TreeType.CLASSIFICATION:
                     node.value = self._majority_class(y)
                 case self.TreeType.REGRESSION:
-                    node.value = np.mean(y)
+                    if self.xgboost and (gradient is not None and hessian is not None):
+                        node.value = -np.sum(gradient) / (
+                            np.sum(hessian) + self.l2
+                        )
+                    else:
+                        node.value = np.mean(y)
                 case _:
                     raise ValueError(
                         f"Unsupported {self.TreeType}, supported values are {list(self.TreeType)}"
                     )
             return node
 
-        node.left = self._build_tree(X[left_mask], y[left_mask], depth + 1)
-        node.right = self._build_tree(X[right_mask], y[right_mask], depth + 1)
+        node.left = self._build_tree(X[left_mask], y[left_mask], depth=depth + 1, gradient=gradient[left_mask], hessian=hessian[left_mask])
+        node.right = self._build_tree(X[right_mask], y[right_mask], depth=depth + 1, gradient=gradient[right_mask], hessian=hessian[right_mask],)
 
         return node
 
-    def fit_node(self, node):
+    def fit_node(self, node, gradient=None, hessian=None):
         X = self.X_train_[node.sub_population]
         y = self.y_train_[node.sub_population]
 
@@ -290,22 +338,35 @@ class ANonSeriousDecisionTree:
                 node.majority_class = self._majority_class(y)
                 node.value = None
             case self.TreeType.REGRESSION:
-                node.value = np.mean(y)
+                if self.xgboost:
+                    node.value = -np.sum(gradient) / (
+                        np.sum(hessian) + self.l2
+                    )
+                else:
+                    node.value = np.mean(y)
 
         _, node.leaf_error = self._leaf_error(y)
         node.number_of_classes = self._class_counts(y)
+        
+        if self.xgboost and (gradient is not None and hessian is not None):
+            node.gradient = gradient
+            node.hessian = hessian
 
         if (
             node.depth >= self.max_depth
-            or len(set(y)) == 1
             or len(y) <= self.minimum_population_size
-        ):
+        ) or (not self.xgboost and len(set(y)) == 1):
             node.is_leaf = True
             match self.tree_type:
                 case self.TreeType.CLASSIFICATION:
                     node.value = self._majority_class(y)
                 case self.TreeType.REGRESSION:
-                    node.value = np.mean(y)
+                    if self.xgboost:
+                        node.value = -np.sum(gradient) / (
+                            np.sum(hessian) + self.l2
+                        )
+                    else:
+                        node.value = np.mean(y)
                 case _:
                     raise ValueError(
                         f"Unsupported {self.tree_type}, supported values are {list(self.TreeType)}"
@@ -316,7 +377,7 @@ class ANonSeriousDecisionTree:
             case self.TreeType.CLASSIFICATION:
                 feature, threshold = self._classification_split(X, y)
             case self.TreeType.REGRESSION:
-                feature, threshold = self._regression_split(X, y)
+                feature, threshold = self._regression_split(X, y, gradient, hessian)
             case _:
                 raise ValueError(
                     f"Unsupported {self.tree_type}, supported values are {list(self.TreeType)}"
@@ -333,7 +394,12 @@ class ANonSeriousDecisionTree:
                 case self.TreeType.CLASSIFICATION:
                     node.value = self._majority_class(y)
                 case self.TreeType.REGRESSION:
-                    node.value = np.mean(y)
+                    if self.xgboost:
+                        node.value = -np.sum(gradient) / (
+                            np.sum(hessian) + self.l2
+                        )
+                    else:
+                        node.value = np.mean(y)
                 case _:
                     raise ValueError(
                         f"Unsupported {self.TreeType}, supported values are {list(self.TreeType)}"
@@ -362,7 +428,12 @@ class ANonSeriousDecisionTree:
                 case self.TreeType.CLASSIFICATION:
                     node.value = self._majority_class(y)
                 case self.TreeType.REGRESSION:
-                    node.value = np.mean(y)
+                    if self.xgboost:
+                        node.value = -np.sum(gradient) / (
+                            np.sum(hessian) + self.l2
+                        )
+                    else:
+                        node.value = np.mean(y)
                 case _:
                     raise ValueError(
                         f"Unsupported {self.TreeType}, supported values are {list(self.TreeType)}"
@@ -377,8 +448,8 @@ class ANonSeriousDecisionTree:
         node.right.depth = node.depth + 1
         node.right.sub_population = right_population
 
-        self.fit_node(node.left)
-        self.fit_node(node.right)
+        self.fit_node(node.left, gradient=gradient[left_mask], hessian=hessian[left_mask])
+        self.fit_node(node.right, gradient=gradient[right_mask], hessian=hessian[right_mask])
 
     def _classification_split(self, X, y):
         best_feature = None
@@ -391,7 +462,9 @@ class ANonSeriousDecisionTree:
         if self.random_criterion is not None:
             match self.random_criterion:
                 case self.RandomCriterion.RANDOM_FEATURE:
-                    features = self.random_feature_criterion(features, number_of_features)
+                    features = self.random_feature_criterion(
+                        features, number_of_features
+                    )
                 case self.RandomCriterion.RANDOM_SPLIT:
                     return self.random_split_criterion(features, X)
                 case _:
@@ -482,10 +555,13 @@ class ANonSeriousDecisionTree:
 
         return best_feature, best_threshold
 
-    def _regression_split(self, X, y):
+    def _regression_split(self, X, y, gradient=None, hessian=None):
         best_feature = None
         best_threshold = None
         best_score = float("inf")
+        
+        if self.xgboost:
+            best_gain = float("-inf")
 
         parent_score = self.mse_mean(y)
 
@@ -502,7 +578,6 @@ class ANonSeriousDecisionTree:
                     raise ValueError(
                         f"Unsupported {self.random_criterion}, supported values are {list(self.RandomCriterion)}"
                     )
-
         for feature in features:
             values = X[:, feature]
             unique_values = np.unique(values)
@@ -518,6 +593,35 @@ class ANonSeriousDecisionTree:
 
                 if np.sum(left_mask) == 0 or np.sum(right_mask) == 0:
                     continue
+
+                if self.xgboost and (gradient is None or hessian is None):
+                    raise RuntimeError(
+                        "XGBoost requires the first and second order derivatives"
+                    )
+                if self.xgboost:
+                    G_parent = np.sum(gradient)
+                    G_left = np.sum(gradient[left_mask])
+                    G_right = np.sum(gradient[right_mask])
+
+                    H_parent = np.sum(hessian)
+                    H_left = np.sum(hessian[left_mask])
+                    H_right = np.sum(hessian[right_mask])
+
+                    gain = (
+                        1 / 2
+                        * (
+                            G_left**2 / (H_left + self.l2)
+                            + G_right**2 / (H_right + self.l2)
+                            - G_parent**2 / (H_parent + self.l2)
+                        )
+                        - self.gamma
+                    )
+
+                    if gain > best_gain:
+                        best_gain = gain
+                        best_feature = feature
+                        best_threshold = threshold
+                    continue
                 left_y = y[left_mask]
                 right_y = y[right_mask]
 
@@ -527,9 +631,13 @@ class ANonSeriousDecisionTree:
                     best_score = score
                     best_feature = feature
                     best_threshold = threshold
+        if self.xgboost:
+            if best_gain <= 0:
+                return None, None
+            else:
+                return best_feature, best_threshold
         if best_feature is None:
             return None, None
-
         improvement = parent_score - best_score
 
         if improvement < self.minimum_gain:
@@ -546,7 +654,6 @@ class ANonSeriousDecisionTree:
         thresholds = (unique_values[1:] + unique_values[:-1]) / 2
         if thresholds.size == 0:
             return (0.0, np.inf)
-
         one_hot = np.eye(self.classes_.size, dtype=np.int32)[
             np.searchsorted(self.classes_, y)
         ]
@@ -601,7 +708,6 @@ class ANonSeriousDecisionTree:
 
             if min_value == max_value:
                 continue
-
             threshold = self.rng.uniform(min_value, max_value)
 
             left_mask = values > threshold
@@ -609,18 +715,15 @@ class ANonSeriousDecisionTree:
 
             if len(values[left_mask]) == 0 or len(values[right_mask]) == 0:
                 continue
-
             return random_feature, threshold
-    
+
     def random_feature_criterion(self, features, number_of_features):
         max_feature_method = None
         match self.max_features:
             case self.MaxFeatures.SQRT:
                 max_feature_method = np.sqrt
             case self.MaxFeatures.LOG2:
-                max_feature_method = lambda x: np.log2(
-                    x + self.config.epsilon
-                )
+                max_feature_method = lambda x: np.log2(x + self.config.epsilon)
             case _:
                 raise ValueError(
                     f"Unsupported {self.max_features}, supported values are {list(self.MaxFeatures)}"
@@ -637,12 +740,8 @@ class ANonSeriousDecisionTree:
             else self.max_number_of_features
         )
 
-        candidate_count = max(
-            1, int(max_feature_method(number_of_features))
-        )
-        _features = self.rng.choice(
-            features, size=candidate_count, replace=False
-        )
+        candidate_count = max(1, int(max_feature_method(number_of_features)))
+        _features = self.rng.choice(features, size=candidate_count, replace=False)
         return _features
 
     def mse(self, y, y_hat):

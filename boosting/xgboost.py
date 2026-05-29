@@ -14,7 +14,7 @@ class XGBoost:
     class LossType(Enum):
         BINARY_CROSS_ENTROPY = 1
         SSE = 2
-    
+
     @dataclass
     class TrainDefaults:
         epsilon: float = 1e-12
@@ -39,6 +39,7 @@ class XGBoost:
         column_sub_sample=1,
         early_stopping=False,
         restore_best=False,
+        log=False,
         config=None,
     ):
         if not (0 < sub_sample <= 1) or not (0 < column_sub_sample <= 1):
@@ -47,6 +48,7 @@ class XGBoost:
             )
         if config is None:
             config = self.TrainDefaults()
+        self.config = config
         self.sub_sample = sub_sample
         self.column_sub_sample = column_sub_sample
         self.boosting_rounds = boosting_rounds
@@ -62,6 +64,7 @@ class XGBoost:
         self.loss_type = loss_type
         self.early_stopping = early_stopping
         self.restore_best = restore_best
+        self.log = log
 
     def fit(self, X, y, X_val, y_val):
         self.X_train_ = X
@@ -69,8 +72,15 @@ class XGBoost:
 
         self.trees = []
         self.feature_indices = []
-        
+
         epsilon = self.config.epsilon
+
+        if self.log:
+            space = " "
+            loading_bar_length = 10
+            padding = 10
+            loading = "."
+            print()
 
         match self.loss_type:
             case self.LossType.BINARY_CROSS_ENTROPY:
@@ -108,12 +118,13 @@ class XGBoost:
                 information_gain=self.information_gain,
                 random_criterion=self.random_criterion,
                 tree_type=self.tree_type,
+                xgboost=True,
             )
 
             pseudo_residual = -self.dloss(y, self.F_x)
             match self.loss_type:
                 case self.LossType.SSE:
-                    total_loss += self.sse(y, self.F_x)
+                    total_loss += self.sse_mean(y, self.F_x)
                 case self.LossType.BINARY_CROSS_ENTROPY:
                     total_loss += self.binary_cross_entropy_loss(y, self.F_x)
                 case _:
@@ -131,15 +142,24 @@ class XGBoost:
             X_sub = X[indices][:, feature_indices]
             pseudo_residual_sub = pseudo_residual[indices]
 
-            tree.fit(X_sub, pseudo_residual_sub)
+            g = self.gradient(y, self.F_x)
+            h = self.hessian(y, self.F_x)
 
-            self.leaf_correction(tree, X_sub, y[indices], self.F_x[indices])
+            g_sub = g[indices]
+            h_sub = h[indices]
+
+            tree.fit(
+                X_sub,
+                pseudo_residual_sub,
+                gradient=g_sub,
+                hessian=h_sub,
+                l2=self.config.l2,
+                gamma=self.config.gamma,
+            )
 
             self.trees.append(tree)
             self.feature_indices.append(feature_indices)
             self.F_x += self.learning_rate * tree.predict(X[:, feature_indices])
-            
-            self.tree_complexity_penalty(total_loss)
 
             _, val_loss = self.evaluate_dataset(X_val, y_val)
             if val_loss < best_val_loss:
@@ -157,6 +177,14 @@ class XGBoost:
                     best_round,
                 )
                 break
+            if self.log:
+                penalty = self.tree_complexity_penalty(total_loss)
+                tree_score = self.tree_structure_score(tree)
+                progression = round % loading_bar_length
+                print(
+                    f"Fitting the tree{loading*progression + space*(loading_bar_length - progression)} [ XGBoost Penalty : {penalty} ] [ Validation Loss : {val_loss} ]{space*padding}",
+                    end="\r"
+                )
         if self.restore_best:
             self.trees = self.trees[:best_number_of_trees]
             self.feature_indices = self.feature_indices[:best_number_of_trees]
@@ -177,8 +205,33 @@ class XGBoost:
                     f"Unsupported {self.LossType}, supported values are {list(self.LossType)}"
                 )
 
+    def gradient(self, y, F_x):
+        match self.loss_type:
+            case self.LossType.BINARY_CROSS_ENTROPY:
+                p_x = self.sigmoid(F_x)
+                return p_x - y
+            case self.LossType.SSE:
+                return F_x - y
+            case _:
+                raise ValueError(
+                    f"Unsupported {self.LossType}, supported values are {list(self.LossType)}"
+                )
+
+    def hessian(self, y, F_x):
+        match self.loss_type:
+            case self.LossType.BINARY_CROSS_ENTROPY:
+                p_x = self.sigmoid(F_x)
+                return p_x * (1 - p_x)
+            case self.LossType.SSE:
+                return np.repeat(1, F_x.shape[0])
+            case _:
+                raise ValueError(
+                    f"Unsupported {self.LossType}, supported values are {list(self.LossType)}"
+                )
+
     def tree_complexity_penalty(self, loss):
         gamma = self.config.gamma
+
         l2 = self.config.l2
 
         complexity = 0
@@ -188,15 +241,28 @@ class XGBoost:
             complexity += gamma * number_of_leaves + 1 / 2 * l2 * np.sum(leaf_scores**2)
         return loss + complexity
 
+    def tree_structure_score(self, tree):
+        l2 = self.config.l2
+        gamma = self.config.gamma
+        tree_score = 0
+        leaves = tree.get_leaves()
+        number_of_leaves = len(leaves)
+        for leaf in leaves:
+            gradients = leaf.gradient
+            hessians = leaf.hessian
+            tree_score += -0.5 * np.sum(gradients) ** 2 / (np.sum(hessians) + l2)
+        tree_score += gamma * number_of_leaves
+        return tree_score
+
     def get_leaf_scores(self, tree):
-        return np.unique(np.asarray([leaf.value for leaf in tree.get_leaves()]))
+        return np.asarray([leaf.value for leaf in tree.get_leaves()])
 
     def sse(self, y, F_x):
         return 1 / 2 * (y - F_x) ** 2
-    
+
     def sse_mean(self, y, F_x):
         return np.mean(self.sse(y, F_x))
-    
+
     def sse_sum(self, y, F_x):
         return np.sum(self.sse(y, F_x))
 
@@ -220,36 +286,6 @@ class XGBoost:
         m = y.shape[0]
         p_x = np.clip(p_x, epsilon, 1.0 - epsilon)
         return -np.sum(y * np.log(p_x) + (1 - y) * np.log(1 - p_x)) / m
-
-    def leaf_correction(self, tree, X, y, F):
-        leaf_to_indices = {}
-        number_of_leaves = len(tree.get_leaves())
-        for i, x in enumerate(X):
-            leaf = tree.predict_one(x, leaf_node=True)
-            leaf_id = id(leaf)
-            if leaf_id not in leaf_to_indices:
-                leaf_to_indices[leaf_id] = {"leaf": leaf, "indices": []}
-            leaf_to_indices[leaf_id]["indices"].append(i)
-        for item in leaf_to_indices.values():
-            leaf = item["leaf"]
-            index = np.array(item["indices"])
-            y_leaf = y[index]
-            F_leaf = F[index]
-            leaf.value = self._correct(y_leaf, F_leaf, number_of_leaves)
-
-    def _correct(self, y, F, number_of_leaves):
-        l2 = self.config.l2
-
-        match self.loss_type:
-            case self.LossType.SSE:
-                return np.sum(y - F) / (number_of_leaves + l2)
-            case self.LossType.BINARY_CROSS_ENTROPY:
-                p = self.sigmoid(F)
-                return np.sum(y - p) / (np.sum(p * (1 - p)) + l2)
-            case _:
-                raise ValueError(
-                    f"Unsupported {self.LossType}, supported values are {list(self.LossType)}"
-                )
 
     def evaluate_dataset(self, X, y):
         if y.ndim == 2:
@@ -399,7 +435,10 @@ if __name__ == "__main__":
     )
 
     xgboost = XGBoost(
-        loss_type=XGBoost.LossType.SSE, restore_best=True, early_stopping=True
+        loss_type=XGBoost.LossType.SSE,
+        restore_best=True,
+        early_stopping=True,
+        log=True,
     )
     xgboost.fit(X_train, y_train, X_val, y_val)
 

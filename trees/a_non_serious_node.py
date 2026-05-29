@@ -20,6 +20,8 @@ class ANonSeriousNode:
         self.max_depth = float("inf")
         self.max_depth_reached = "MAX_DEPTH_REACHED"
         self.categorical_split = False
+        # self.gradient = None
+        # self.hessian = None
 
     def left_add_prefix(self, text):
         if self.depth > self.max_depth:
