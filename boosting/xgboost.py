@@ -21,11 +21,11 @@ class XGBoost:
         l2: float = 0.5
         gamma: float = 0.2
         threshold: float = 0.5
+        learning_rate: float = 0.03
 
     def __init__(
         self,
         boosting_rounds=100,
-        learning_rate=0.03,
         max_depth=10,
         minimum_population_size=2,
         minimum_gain=0.001,
@@ -52,7 +52,6 @@ class XGBoost:
         self.sub_sample = sub_sample
         self.column_sub_sample = column_sub_sample
         self.boosting_rounds = boosting_rounds
-        self.learning_rate = learning_rate
         self.max_depth = max_depth
         self.minimum_population_size = minimum_population_size
         self.minimum_gain = minimum_gain
@@ -66,7 +65,7 @@ class XGBoost:
         self.restore_best = restore_best
         self.log = log
 
-    def fit(self, X, y, X_val, y_val):
+    def fit(self, X, y, X_val, y_val, optimized=False):
         self.X_train_ = X
         self.y_train_ = y
 
@@ -74,6 +73,7 @@ class XGBoost:
         self.feature_indices = []
 
         epsilon = self.config.epsilon
+        learning_rate = self.config.learning_rate
 
         if self.log:
             space = " "
@@ -119,7 +119,11 @@ class XGBoost:
                 random_criterion=self.random_criterion,
                 tree_type=self.tree_type,
                 xgboost=True,
+                vectorized=True,
             )
+            tree.xgboost_optimized = optimized
+            tree.l2 = self.config.l2
+            tree.gamma = self.config.gamma
 
             pseudo_residual = -self.dloss(y, self.F_x)
             match self.loss_type:
@@ -153,13 +157,11 @@ class XGBoost:
                 pseudo_residual_sub,
                 gradient=g_sub,
                 hessian=h_sub,
-                l2=self.config.l2,
-                gamma=self.config.gamma,
             )
 
             self.trees.append(tree)
             self.feature_indices.append(feature_indices)
-            self.F_x += self.learning_rate * tree.predict(X[:, feature_indices])
+            self.F_x += learning_rate * tree.predict(X[:, feature_indices])
 
             _, val_loss = self.evaluate_dataset(X_val, y_val)
             if val_loss < best_val_loss:
@@ -182,7 +184,7 @@ class XGBoost:
                 tree_score = self.tree_structure_score(tree)
                 progression = round % loading_bar_length
                 print(
-                    f"Fitting the tree{loading*progression + space*(loading_bar_length - progression)} [ XGBoost Penalty : {penalty} ] [ Validation Loss : {val_loss} ]{space*padding}",
+                    f"Fitting the tree{loading*progression + space*(loading_bar_length - progression)} [ XGBoost Penalty : {penalty} ] [ Tree Structure Score : {tree_score} ] [ Validation Loss : {val_loss} ]{space*padding}",
                     end="\r"
                 )
         if self.restore_best:
@@ -190,7 +192,7 @@ class XGBoost:
             self.feature_indices = self.feature_indices[:best_number_of_trees]
             self.F_x = np.repeat(self.F_0x, X.shape[0])
             for tree, feature_indices in zip(self.trees, self.feature_indices):
-                self.F_x += self.learning_rate * tree.predict(X[:, feature_indices])
+                self.F_x += learning_rate * tree.predict(X[:, feature_indices])
         return self
 
     def dloss(self, y, F_x):
@@ -307,7 +309,7 @@ class XGBoost:
     def predict(self, X):
         prediction = np.repeat(self.F_0x, X.shape[0])
         for tree, feature_indices in zip(self.trees, self.feature_indices):
-            prediction += self.learning_rate * tree.predict(X[:, feature_indices])
+            prediction += self.config.learning_rate * tree.predict(X[:, feature_indices])
         return prediction
 
     def predict_proba(self, X):
@@ -320,7 +322,7 @@ class XGBoost:
     def visualize(self):
         if self.X_train_ is None or self.y_train_ is None:
             raise RuntimeError("Model is not fit")
-        os.makedirs("img", exist_ok=True)
+        os.makedirs("boosting/img", exist_ok=True)
         X = self.X_train_
         y = self.y_train_
         y_pred = self.predict(X)
@@ -337,7 +339,7 @@ class XGBoost:
         plt.ylabel("Predicted y")
         plt.title("Actual vs Predicted")
         plt.grid(True)
-        plt.savefig("img/prdctns.png")
+        plt.savefig("boosting/img/prdctns.png")
         plt.show()
 
         residuals = y - y_pred
@@ -350,7 +352,7 @@ class XGBoost:
         plt.ylabel("Residual: y - prediction")
         plt.title("Residual Plot")
         plt.grid(True)
-        plt.savefig("img/rsdl.png")
+        plt.savefig("boosting/img/rsdl.png")
         plt.show()
 
         losses = []
@@ -361,7 +363,7 @@ class XGBoost:
         losses.append(initial_mse)
 
         for tree, feature_indices in zip(self.trees, self.feature_indices):
-            current_pred += self.learning_rate * tree.predict(X[:, feature_indices])
+            current_pred += self.config.learning_rate * tree.predict(X[:, feature_indices])
             mse = np.mean((y - current_pred) ** 2)
             losses.append(mse)
 
@@ -372,7 +374,7 @@ class XGBoost:
         plt.ylabel("Training MSE")
         plt.title("Training Loss Over Boosting Rounds")
         plt.grid(True)
-        plt.savefig("img/lsss.png")
+        plt.savefig("boosting/img/lsss.png")
         plt.show()
 
         x1_min, x1_max = X[:, 0].min(), X[:, 0].max()
@@ -398,7 +400,7 @@ class XGBoost:
         plt.ylabel("Feature 2")
         plt.title("Gradient Boosting Prediction Surface")
         plt.grid(True)
-        plt.savefig("img/prdctn_srfc.png")
+        plt.savefig("boosting/img/prdctn_srfc.png")
         plt.show()
 
         fig = plt.figure(figsize=(9, 7))
@@ -412,7 +414,7 @@ class XGBoost:
         ax.set_zlabel("Target / Prediction")
         ax.set_title("Learned Regression Surface")
 
-        plt.savefig("img/3d_srfc.png")
+        plt.savefig("boosting/img/3d_srfc.png")
         plt.show()
 
 
@@ -440,6 +442,6 @@ if __name__ == "__main__":
         early_stopping=True,
         log=True,
     )
-    xgboost.fit(X_train, y_train, X_val, y_val)
+    xgboost.fit(X_train, y_train, X_val, y_val, optimized=False)
 
     xgboost.visualize()

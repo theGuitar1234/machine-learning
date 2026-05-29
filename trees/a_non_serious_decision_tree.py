@@ -60,7 +60,7 @@ class ANonSeriousDecisionTree:
         minimum_population_size=2,
         minimum_split_size=1,
         minimum_gain=0.001,
-        max_depth=3,
+        max_depth=10,
         str_max_depth=float("inf"),
         categorical=False,
         adjacent=False,
@@ -149,8 +149,6 @@ class ANonSeriousDecisionTree:
         node=False,
         gradient=None,
         hessian=None,
-        l2=None,
-        gamma=None,
     ):
         if y.ndim == 2:
             y = np.argmax(y, axis=1)
@@ -164,14 +162,11 @@ class ANonSeriousDecisionTree:
         self.class_priors_ = class_counts / len(y)
 
         if self.xgboost and (
-            gradient is None or hessian is None or l2 is None or gamma is None
+            gradient is None or hessian is None
         ):
             raise RuntimeError(
-                "XGBoost requires the first and second order derivatives and lambda/gamma"
+                "XGBoost requires the first and second order derivatives"
             )
-        if self.xgboost:
-            self.l2 = l2
-            self.gamma = gamma
 
         if node:
             self.root = ANonSeriousNode()
@@ -246,7 +241,7 @@ class ANonSeriousDecisionTree:
                 case self.TreeType.CLASSIFICATION:
                     node.value = self._majority_class(y)
                 case self.TreeType.REGRESSION:
-                    if self.xgboost and (gradient is not None or hessian is not None):
+                    if self.xgboost and (gradient is not None and hessian is not None):
                         node.value = -np.sum(gradient) / (
                             np.sum(hessian) + self.l2
                         )
@@ -279,7 +274,7 @@ class ANonSeriousDecisionTree:
                 case self.TreeType.CLASSIFICATION:
                     node.value = self._majority_class(y)
                 case self.TreeType.REGRESSION:
-                    if self.xgboost and (gradient is not None or hessian is not None):
+                    if self.xgboost and (gradient is not None and hessian is not None):
                         node.value = -np.sum(gradient) / (
                             np.sum(hessian) + self.l2
                         )
@@ -560,13 +555,32 @@ class ANonSeriousDecisionTree:
         best_threshold = None
         best_score = float("inf")
         
-        if self.xgboost:
-            best_gain = float("-inf")
-
         parent_score = self.mse_mean(y)
 
         number_of_features = X.shape[1]
         features = np.arange(number_of_features)
+        
+        if self.xgboost:
+            if gradient is None or hessian is None:
+                raise RuntimeError(
+                    "XGBoost requires the first and second order derivatives"
+                )
+            best_gain = float("-inf")
+            G_parent = np.sum(gradient)
+            H_parent = np.sum(hessian)
+        
+        if self.xgboost_optimized:
+            self.xgboost_split_gain(
+                X=X,
+                best_feature=best_feature,
+                best_threshold=best_threshold,
+                features=features,
+                gradient=gradient,
+                hessian=hessian,
+                G_parent=G_parent,
+                H_parent=H_parent,
+                best_gain=best_gain,
+            )
 
         if self.random_criterion is not None:
             match self.random_criterion:
@@ -578,13 +592,13 @@ class ANonSeriousDecisionTree:
                     raise ValueError(
                         f"Unsupported {self.random_criterion}, supported values are {list(self.RandomCriterion)}"
                     )
+
         for feature in features:
             values = X[:, feature]
             unique_values = np.unique(values)
 
             if len(unique_values) <= 1:
                 continue
-
             thresholds = (unique_values[1:] + unique_values[:-1]) / 2
 
             for threshold in thresholds:
@@ -593,30 +607,18 @@ class ANonSeriousDecisionTree:
 
                 if np.sum(left_mask) == 0 or np.sum(right_mask) == 0:
                     continue
-
-                if self.xgboost and (gradient is None or hessian is None):
-                    raise RuntimeError(
-                        "XGBoost requires the first and second order derivatives"
-                    )
                 if self.xgboost:
-                    G_parent = np.sum(gradient)
+                    if gradient is None or hessian is None:
+                        raise RuntimeError(
+                            "XGBoost requires the first and second order derivatives"
+                        )
                     G_left = np.sum(gradient[left_mask])
                     G_right = np.sum(gradient[right_mask])
-
-                    H_parent = np.sum(hessian)
+                    
                     H_left = np.sum(hessian[left_mask])
                     H_right = np.sum(hessian[right_mask])
-
-                    gain = (
-                        1 / 2
-                        * (
-                            G_left**2 / (H_left + self.l2)
-                            + G_right**2 / (H_right + self.l2)
-                            - G_parent**2 / (H_parent + self.l2)
-                        )
-                        - self.gamma
-                    )
-
+                    
+                    gain = self._xgboost_gain(G_parent=G_parent, G_left=G_left, G_right=G_right, H_parent=H_parent, H_left=H_left, H_right=H_right)
                     if gain > best_gain:
                         best_gain = gain
                         best_feature = feature
@@ -643,6 +645,67 @@ class ANonSeriousDecisionTree:
         if improvement < self.minimum_gain:
             return None, None
         return best_feature, best_threshold
+    
+    def xgboost_split_gain(
+        self,
+        X,
+        best_feature,
+        best_threshold,
+        features,
+        gradient,
+        hessian,
+        G_parent,
+        H_parent,
+        best_gain,
+    ):
+        for feature in features:
+            values = X[:feature]
+           
+            order = np.argsort(values)
+           
+            sorted_values = values[order]
+            sorted_gradient = gradient[order]
+            sorted_hessian = hessian[order]
+           
+            G_right = 0.0
+            H_right = 0.0
+           
+            for i in range(len(sorted_values) - 1):
+                G_right += sorted_gradient[i]
+                H_right += sorted_hessian[i]
+               
+                if sorted_values[i] == sorted_values[i + 1]:
+                   continue
+                right_count = i + 1
+                left_count = len(sorted_values) - right_count
+                
+                if (
+                    left_count < self.minimum_split_size
+                    or right_count < self.minimum_split_size
+                ):
+                    continue
+                G_left = G_parent - G_right
+                H_left = H_parent - H_right
+                
+                gain = self._xgboost_gain(G_parent=G_parent, G_left=G_left, G_right=G_right, H_parent=H_parent, H_left=H_left, H_right=H_right)
+                if gain > best_gain:
+                    best_gain = gain
+                    best_feature = feature
+                    best_threshold = (sorted_values[i] + sorted_values[i + 1]) / 2
+            if best_gain <= 0:
+                return None, None
+            return best_feature, best_threshold
+                
+    def _xgboost_gain(self, G_parent, G_left, G_right, H_parent, H_left, H_right):
+        return (
+            1 / 2
+            * (
+                G_left**2 / (H_left + self.l2)
+                + G_right**2 / (H_right + self.l2)
+                - G_parent**2 / (H_parent + self.l2)
+            )
+            - self.gamma
+        )
 
     def _vectorized_split_search(self, X, y, feature):
         if self.categorical:
