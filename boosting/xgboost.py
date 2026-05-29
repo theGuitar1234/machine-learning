@@ -34,6 +34,8 @@ class XGBoost:
         information_gain=0.01,
         random_criterion=None,
         tree_type=ANonSeriousDecisionTree.TreeType.REGRESSION,
+        proposal=None,
+        xgboost_split=None,
         loss_type=None,
         sub_sample=0.8,
         column_sub_sample=1,
@@ -64,6 +66,8 @@ class XGBoost:
         self.early_stopping = early_stopping
         self.restore_best = restore_best
         self.log = log
+        self.proposal = proposal
+        self.xgboost_split = xgboost_split
 
     def fit(self, X, y, X_val, y_val, optimized=False):
         self.X_train_ = X
@@ -120,6 +124,8 @@ class XGBoost:
                 tree_type=self.tree_type,
                 xgboost=True,
                 vectorized=True,
+                xgboost_split=self.xgboost_split,
+                xgboost_proposal=self.proposal
             )
             tree.xgboost_optimized = optimized
             tree.l2 = self.config.l2
@@ -441,7 +447,9 @@ if __name__ == "__main__":
         restore_best=True,
         early_stopping=True,
         log=True,
+        xgboost_split=ANonSeriousDecisionTree.XGBoostSplit.APPROXIMATE,
+        proposal=ANonSeriousDecisionTree.XGBoostProposal.GLOBAL,
     )
-    xgboost.fit(X_train, y_train, X_val, y_val, optimized=False)
+    xgboost.fit(X_train, y_train, X_val, y_val, optimized=True)
 
     xgboost.visualize()
