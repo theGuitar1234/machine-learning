@@ -22,6 +22,8 @@ class XGBoost:
         gamma: float = 0.2
         threshold: float = 0.5
         learning_rate: float = 0.03
+        validation_tolerance: float = 10
+        patience: int = 100
 
     def __init__(
         self,
@@ -44,6 +46,7 @@ class XGBoost:
         log=False,
         config=None,
         candidate_proposal=None,
+        missing_value=None,
     ):
         if not (0 < sub_sample <= 1) or not (0 < column_sub_sample <= 1):
             raise ValueError(
@@ -70,6 +73,7 @@ class XGBoost:
         self.proposal = proposal
         self.xgboost_split = xgboost_split
         self.candidate_proposal = candidate_proposal
+        self.missing_value = missing_value
 
     def fit(self, X, y, X_val, y_val, optimized=False):
         self.X_train_ = X
@@ -80,6 +84,8 @@ class XGBoost:
 
         epsilon = self.config.epsilon
         learning_rate = self.config.learning_rate
+        validation_tolerance = self.config.validation_tolerance
+        patience = self.config.patience
 
         if self.log:
             space = " "
@@ -110,7 +116,6 @@ class XGBoost:
 
         total_loss = 0
         best_val_loss = float("inf")
-        patience = 100
         best_round = -1
         best_number_of_trees = 0
         patience_counter = 0
@@ -133,6 +138,7 @@ class XGBoost:
             tree.xgboost_optimized = optimized
             tree.l2 = self.config.l2
             tree.gamma = self.config.gamma
+            tree.missing_value = missing_value
 
             pseudo_residual = -self.dloss(y, self.F_x)
             match self.loss_type:
@@ -173,7 +179,7 @@ class XGBoost:
             self.F_x += learning_rate * tree.predict(X[:, feature_indices])
 
             _, val_loss = self.evaluate_dataset(X_val, y_val)
-            if val_loss < best_val_loss:
+            if (best_val_loss - val_loss > validation_tolerance):
                 best_val_loss = val_loss
                 best_round = round
                 patience_counter = 0
@@ -182,7 +188,7 @@ class XGBoost:
                 patience_counter += 1
             if self.early_stopping and patience_counter >= patience:
                 print(
-                    "Overfitting detected. Early stopping at round: ",
+                    "\nOverfitting detected. Early stopping at round: ",
                     round,
                     "Best Round : ",
                     best_round,
@@ -193,7 +199,7 @@ class XGBoost:
                 tree_score = self.tree_structure_score(tree)
                 progression = round % loading_bar_length
                 print(
-                    f"Fitting the tree{loading*progression + space*(loading_bar_length - progression)} [ XGBoost Penalty : {penalty} ] [ Tree Structure Score : {tree_score} ] [ Validation Loss : {val_loss} ]{space*padding}",
+                    f"Fitting the tree{loading*progression + space*(loading_bar_length - progression)} [ XGBoost Penalty : {penalty:.2f} ] [ Tree Structure Score : {tree_score:.2f} ] [ Validation Loss : {val_loss} Best : {best_val_loss} Patience : {patience_counter}]{space*padding}",
                     end="\r"
                 )
         if self.restore_best:
@@ -444,7 +450,17 @@ if __name__ == "__main__":
         random_state=42,
         # stratify=y_train_val
     )
-
+    
+    missing_value = np.nan
+    # n_missing = 15
+    # missing_indices = np.random.choice(
+    #     X_train.shape[0],
+    #     size=n_missing,
+    #     replace=False,
+    # )
+    # X_train[missing_indices] = missing_value
+    # y_train[missing_indices] = missing_value
+  
     xgboost = XGBoost(
         loss_type=XGBoost.LossType.SSE,
         restore_best=True,
@@ -453,7 +469,8 @@ if __name__ == "__main__":
         xgboost_split=ANonSeriousDecisionTree.XGBoostSplit.APPROXIMATE,
         proposal=ANonSeriousDecisionTree.XGBoostProposal.LOCAL,
         candidate_proposal=ANonSeriousDecisionTree.XGBoostCandidate.WEIGHTED_QUANTILE,
+        missing_value=missing_value,
     )
     xgboost.fit(X_train, y_train, X_val, y_val, optimized=True)
 
-    xgboost.visualize()
+    # xgboost.visualize()
