@@ -53,6 +53,11 @@ class ANonSeriousDecisionTree:
     class XGBoostProposal(Enum):
         GLOBAL = 1
         LOCAL = 2
+    
+    class XGBoostCandidate(Enum):
+        WEIGHTED_QUANTILE = 1
+        UNWEIGHTED_QUANTILE = 2
+        RANDOM = 3
 
     class XGBoostSplit(Enum):
         EXACT = 1
@@ -87,6 +92,7 @@ class ANonSeriousDecisionTree:
         xgboost=False,
         xgboost_split=None,
         xgboost_proposal=None,
+        xgboost_candidate_proposal=None,
     ):
         if categorical and vectorized:
             raise RuntimeError("Categorical data can't be used for vectorized search")
@@ -117,6 +123,7 @@ class ANonSeriousDecisionTree:
         self.xgboost = xgboost
         self.xgboost_split = xgboost_split
         self.xgboost_proposal = xgboost_proposal
+        self.xgboost_candidate_proposal = xgboost_candidate_proposal
 
     def __str__(self):
         return str(self.root)
@@ -182,14 +189,13 @@ class ANonSeriousDecisionTree:
             if (
                 self.xgboost
                 and self.xgboost_split is self.XGBoostSplit.APPROXIMATE
-                and self.xgboost_proposal is self.XGBoostProposal.GLOBAL 
+                and self.xgboost_proposal is self.XGBoostProposal.GLOBAL
             ):
                 self.global_candidates = {}
                 for feature in range(X.shape[1]):
                     self.global_candidates[feature] = self.weighted_quantile_candidates(
-                        X[:, feature],
-                        hessian
-                    )                
+                        X[:, feature], hessian
+                    )
 
         if node:
             self.root = ANonSeriousNode()
@@ -652,28 +658,36 @@ class ANonSeriousDecisionTree:
                     case self.XGBoostProposal.GLOBAL:
                         thresholds = self.global_candidates[feature]
                     case self.XGBoostProposal.LOCAL:
-                        thresholds = self.weighted_quantile_candidates(values, hessian)
-                    case _: raise ValueError(f"Unsupported {self.XGBoostProposal}, supported values are {list(self.XGBoostProposal)}")
+                        thresholds = self.propose_candidates(values, hessian)
+                    case _:
+                        raise ValueError(
+                            f"Unsupported {self.XGBoostProposal}, supported values are {list(self.XGBoostProposal)}"
+                        )
             for threshold in thresholds:
                 left_mask = values > threshold
                 right_mask = values <= threshold
 
                 # if np.sum(left_mask) == 0 or np.sum(right_mask) == 0:
-                if np.sum(left_mask) < self.minimum_split_size or np.sum(right_mask) < self.minimum_split_size:
+                if (
+                    np.sum(left_mask) < self.minimum_split_size
+                    or np.sum(right_mask) < self.minimum_split_size
+                ):
                     continue
                 if self.xgboost:
-                    best_feature, best_threshold, best_gain = self._xgboost_split_gain_unoptimized(
-                        gradient=gradient, 
-                        hessian=hessian, 
-                        left_mask=left_mask, 
-                        right_mask=right_mask, 
-                        feature=feature, 
-                        threshold=threshold,
-                        G_parent=G_parent,
-                        H_parent=H_parent,
-                        best_feature=best_feature,
-                        best_threshold=best_threshold,
-                        best_gain=best_gain,
+                    best_feature, best_threshold, best_gain = (
+                        self._xgboost_split_gain_unoptimized(
+                            gradient=gradient,
+                            hessian=hessian,
+                            left_mask=left_mask,
+                            right_mask=right_mask,
+                            feature=feature,
+                            threshold=threshold,
+                            G_parent=G_parent,
+                            H_parent=H_parent,
+                            best_feature=best_feature,
+                            best_threshold=best_threshold,
+                            best_gain=best_gain,
+                        )
                     )
                     continue
                 left_y = y[left_mask]
@@ -777,12 +791,14 @@ class ANonSeriousDecisionTree:
                 match self.xgboost_proposal:
                     case self.XGBoostProposal.GLOBAL:
                         candidates = self.global_candidates[feature]
-                        bucket_G, bucket_H, bucket_count = self.bucket_stats_from_candidates(
-                            values, gradient, hessian, candidates
+                        bucket_G, bucket_H, bucket_count = (
+                            self.bucket_stats_from_candidates(
+                                values, gradient, hessian, candidates
+                            )
                         )
                     case self.XGBoostProposal.LOCAL:
-                        candidates, bucket_G, bucket_H, bucket_count = self.weighted_quantile_buckets(
-                            values, gradient, hessian
+                        candidates, bucket_G, bucket_H, bucket_count = (
+                            self.weighted_quantile_buckets(values, gradient, hessian)
                         )
                     case _:
                         raise ValueError(
@@ -796,7 +812,7 @@ class ANonSeriousDecisionTree:
             for boundary in range(candidate_range):
                 G_right += bucket_G[boundary]
                 H_right += bucket_H[boundary]
-                
+
                 right_count += bucket_count[boundary]
                 left_count = len(values) - right_count
 
@@ -824,10 +840,22 @@ class ANonSeriousDecisionTree:
             return None, None
         return best_feature, best_threshold
 
-    def _xgboost_split_gain_unoptimized(self, gradient, hessian, left_mask, right_mask, feature, threshold, G_parent, H_parent, best_feature, best_threshold, best_gain):
+    def _xgboost_split_gain_unoptimized(
+        self,
+        gradient,
+        hessian,
+        left_mask,
+        right_mask,
+        feature,
+        threshold,
+        G_parent,
+        H_parent,
+        best_feature,
+        best_threshold,
+        best_gain,
+    ):
         # G_left = np.sum(gradient[left_mask])
         # H_left = np.sum(hessian[left_mask])
-
         G_right = np.sum(gradient[right_mask])
         H_right = np.sum(hessian[right_mask])
 
@@ -871,13 +899,41 @@ class ANonSeriousDecisionTree:
 
         target_weights = np.linspace(0, total_weight, self.config.max_xgboost_bins + 1)[
             1:-1
-        ]  # ?
+        ]
 
         candidate_indices = np.searchsorted(cumulative_weight, target_weights)
         return np.unique(sorted_values[candidate_indices])
 
+    def unweighted_quantile_candidates(self, values):
+        quantile_positions = np.linspace(0, 1, self.config.max_xgboost_bins + 1)[1:-1]
+        candidates = np.quantile(values, quantile_positions)
+        return np.unique(candidates)
+
+    def random_candidate_thresholds(self, values):
+        unique_values = np.unique(values)
+        if len(unique_values) <= self.config.max_xgboost_bins:
+            return unique_values
+        candidates = self.rng.choice(
+            unique_values,
+            size=self.config.max_xgboost_bins,
+            replace=False,
+        )
+        return np.sort(candidates)
+    
+    def propose_candidates(self, values, hessian):
+        match self.xgboost_candidate_proposal:
+            case self.XGBoostCandidate.WEIGHTED_QUANTILE:
+                candidates = self.weighted_quantile_candidates(values, hessian)
+            case self.XGBoostCandidate.UNWEIGHTED_QUANTILE:
+                candidates = self.unweighted_quantile_candidates(values)
+            case self.XGBoostCandidate.RANDOM:
+                candidates = self.random_candidate_thresholds(values)
+            case _:
+                raise ValueError(f"Unsupported {self.XGBoostCandidate}, supported values are {list(self.XGBoostCandidate)}")
+        return candidates
+
     def weighted_quantile_buckets(self, values, gradient, hessian):
-        candidates = self.weighted_quantile_candidates(values, hessian)
+        candidates = self.propose_candidates(values, hessian)
         bucket_G, bucket_H, bucket_count = self.bucket_stats_from_candidates(
             values,
             gradient,
@@ -885,7 +941,7 @@ class ANonSeriousDecisionTree:
             candidates,
         )
         return candidates, bucket_G, bucket_H, bucket_count
-    
+
     def bucket_stats_from_candidates(self, values, gradient, hessian, candidates):
         bucket_ids = np.searchsorted(candidates, values, side="left")
         bucket_G = np.bincount(

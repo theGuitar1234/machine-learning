@@ -43,6 +43,7 @@ class XGBoost:
         restore_best=False,
         log=False,
         config=None,
+        candidate_proposal=None,
     ):
         if not (0 < sub_sample <= 1) or not (0 < column_sub_sample <= 1):
             raise ValueError(
@@ -68,6 +69,7 @@ class XGBoost:
         self.log = log
         self.proposal = proposal
         self.xgboost_split = xgboost_split
+        self.candidate_proposal = candidate_proposal
 
     def fit(self, X, y, X_val, y_val, optimized=False):
         self.X_train_ = X
@@ -125,7 +127,8 @@ class XGBoost:
                 xgboost=True,
                 vectorized=True,
                 xgboost_split=self.xgboost_split,
-                xgboost_proposal=self.proposal
+                xgboost_proposal=self.proposal,
+                xgboost_candidate_proposal=self.candidate_proposal,
             )
             tree.xgboost_optimized = optimized
             tree.l2 = self.config.l2
@@ -449,6 +452,7 @@ if __name__ == "__main__":
         log=True,
         xgboost_split=ANonSeriousDecisionTree.XGBoostSplit.APPROXIMATE,
         proposal=ANonSeriousDecisionTree.XGBoostProposal.GLOBAL,
+        candidate_proposal=ANonSeriousDecisionTree.XGBoostCandidate.WEIGHTED_QUANTILE,
     )
     xgboost.fit(X_train, y_train, X_val, y_val, optimized=True)
 
