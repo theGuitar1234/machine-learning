@@ -451,7 +451,7 @@ if __name__ == "__main__":
         early_stopping=True,
         log=True,
         xgboost_split=ANonSeriousDecisionTree.XGBoostSplit.APPROXIMATE,
-        proposal=ANonSeriousDecisionTree.XGBoostProposal.GLOBAL,
+        proposal=ANonSeriousDecisionTree.XGBoostProposal.LOCAL,
         candidate_proposal=ANonSeriousDecisionTree.XGBoostCandidate.WEIGHTED_QUANTILE,
     )
     xgboost.fit(X_train, y_train, X_val, y_val, optimized=True)
