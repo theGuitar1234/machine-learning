@@ -49,6 +49,7 @@ class XGBoost:
         candidate_proposal=None,
         missing_value=None,
         vectorized=False,
+        preprocess=False,
     ):
         if not (0 < sub_sample <= 1) or not (0 < column_sub_sample <= 1):
             raise ValueError(
@@ -79,6 +80,7 @@ class XGBoost:
         self.candidate_proposal = candidate_proposal
         self.missing_value = missing_value
         self.purpose_missing = purpose_missing
+        self.preprocess = preprocess
 
     def fit(self, X, y, X_val, y_val, optimized=False):
         self.X_train_ = X
@@ -139,12 +141,13 @@ class XGBoost:
                 xgboost_split=self.xgboost_split,
                 xgboost_proposal=self.proposal,
                 xgboost_candidate_proposal=self.candidate_proposal,
+                xgboost_optimized = optimized,
+                l2 = self.config.l2,
+                gamma = self.config.gamma,
+                missing_value = self.missing_value,
+                purpose_missing = self.purpose_missing,
+                preprocess = self.preprocess,
             )
-            tree.xgboost_optimized = optimized
-            tree.l2 = self.config.l2
-            tree.gamma = self.config.gamma
-            tree.missing_value = self.missing_value
-            tree.purpose_missing = self.purpose_missing
 
             pseudo_residual = -self.dloss(y, self.F_x)
             match self.loss_type:
@@ -460,24 +463,25 @@ if __name__ == "__main__":
     missing_value = np.nan
     n_missing = 15
 
-    missing_indices = np.random.choice(
-        X_train.shape[0],
-        size=n_missing,
-        replace=False,
-    )
-    X_train[missing_indices] = missing_value
+    # missing_indices = np.random.choice(
+    #     X_train.shape[0],
+    #     size=n_missing,
+    #     replace=False,
+    # )
+    # X_train[missing_indices] = missing_value
 
     xgboost = XGBoost(
         loss_type=XGBoost.LossType.SSE,
         restore_best=True,
         early_stopping=True,
         log=True,
-        xgboost_split=ANonSeriousDecisionTree.XGBoostSplit.APPROXIMATE,
+        xgboost_split=ANonSeriousDecisionTree.XGBoostSplit.EXACT,
         proposal=ANonSeriousDecisionTree.XGBoostProposal.LOCAL,
         candidate_proposal=ANonSeriousDecisionTree.XGBoostCandidate.WEIGHTED_QUANTILE,
         missing_value=missing_value,
-        purpose_missing=True,
-        vectorized=False,
+        purpose_missing=False,
+        vectorized=True,
+        preprocess=False,
     )
     xgboost.fit(X_train, y_train, X_val, y_val, optimized=True)
 

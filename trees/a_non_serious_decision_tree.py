@@ -98,11 +98,18 @@ class ANonSeriousDecisionTree:
         xgboost_proposal=None,
         xgboost_candidate_proposal=None,
         missing_value=np.nan,
+        preprocess=False,
+        xgboost_optimized=False,
+        purpose_missing=False,
+        l2=None,
+        gamma=0.0,
     ):
         if categorical and vectorized:
             raise RuntimeError("Categorical data can't be used for vectorized search")
         if xgboost and tree_type is not self.TreeType.REGRESSION:
             raise RuntimeError("XGBoost uses Regression Trees")
+        if preprocess and not xgboost:
+            raise RuntimeError("Column preprocessing is currently only supported for XGBoost-style trees")
         self.rng = np.random.default_rng(seed)
         self.root = None
         self.max_depth = max_depth
@@ -130,6 +137,13 @@ class ANonSeriousDecisionTree:
         self.xgboost_proposal = xgboost_proposal
         self.xgboost_candidate_proposal = xgboost_candidate_proposal
         self.missing_value = missing_value
+        self.preprocess = preprocess
+        self.xgboost_optimized = xgboost_optimized
+        self.purpose_missing = purpose_missing
+        self.l2 = config.l2 if l2 is None else l2
+        self.gamma = gamma
+        self.preprocessed_columns = None
+        self.global_candidates = None
 
     def __str__(self):
         return str(self.root)
@@ -166,7 +180,22 @@ class ANonSeriousDecisionTree:
         _node.depth = node.depth + 1
         _node.sub_population = sub_population
         return _node
-
+    
+    def preprocess_columns(self, X):
+        blocks = {}
+        for feature in range(X.shape[1]):
+            values = X[:, feature]
+            missing_mask = self._missing_mask(values)
+            observed_row_ids = np.where(~missing_mask)[0]
+            values = values[observed_row_ids]
+            order = np.argsort(values)
+            blocks[feature] = {
+                "rows": observed_row_ids[order],
+                "values": values[order],
+                "missing_rows": np.where(missing_mask)[0],
+            }
+        return blocks
+        
     def fit(
         self,
         X,
@@ -182,10 +211,16 @@ class ANonSeriousDecisionTree:
             raise ValueError(
                 f"X and y must match in shapes : {X.shape[0]} != {y.shape[0]}"
             )
+        root_row_indices = None
+        if self.xgboost and self.preprocess:
+            self.preprocessed_columns = self.preprocess_columns(X)
+            root_row_indices = np.arange(X.shape[0])
         self.X_train_ = X
         self.y_train_ = y
         self.classes_, class_counts = np.unique(y, return_counts=True)
         self.class_priors_ = class_counts / len(y)
+        self.gradient_ = gradient
+        self.hessian_ = hessian
 
         if self.xgboost and (gradient is None or hessian is None):
             raise RuntimeError(
@@ -200,7 +235,7 @@ class ANonSeriousDecisionTree:
                 self.global_candidates = {}
                 for feature in range(X.shape[1]):
                     self.global_candidates[feature] = self.weighted_quantile_candidates(
-                        X[:, feature], hessian
+                        feature=feature, values=X[:, feature], hessian=hessian, row_indices=root_row_indices
                     )
 
         if node:
@@ -211,7 +246,7 @@ class ANonSeriousDecisionTree:
             self.fit_node(self.root, gradient, hessian)
         else:
             self.root = self._build_tree(
-                X, y, depth=0, gradient=gradient, hessian=hessian
+                self.X_train_, self.y_train_, depth=0, row_indices=root_row_indices, gradient=self.gradient_, hessian=self.hessian_
             )
 
         if verbose:
@@ -242,7 +277,11 @@ class ANonSeriousDecisionTree:
 
         return self
 
-    def _build_tree(self, X, y, depth, gradient=None, hessian=None):
+    def _build_tree(self, X, y, depth, row_indices=None, gradient=None, hessian=None):
+        if self.preprocess:
+            y = self.y_train_[row_indices]
+            gradient = self.gradient_[row_indices]
+            hessian = self.hessian_[row_indices]
         node = ANonSeriousNode()
         if not self.is_root_set:
             node.is_root = True
@@ -289,7 +328,7 @@ class ANonSeriousDecisionTree:
             case self.TreeType.CLASSIFICATION:
                 feature, threshold = self._classification_split(X, y)
             case self.TreeType.REGRESSION:
-                feature, threshold = self._regression_split(X, y, gradient=gradient, hessian=hessian, node=node)
+                feature, threshold = self._regression_split(X, y, gradient=gradient, hessian=hessian, node=node, row_indices=row_indices)
             case _:
                 raise ValueError(
                     f"Unsupported {self.tree_type}, supported values are {list(self.TreeType)}"
@@ -319,16 +358,19 @@ class ANonSeriousDecisionTree:
         node.threshold = threshold
         node.value = None
         
+        values = X[:, feature]
+        if row_indices is not None:
+            values = self.X_train_[row_indices, feature]
+        
         if node.default_missing_value_direction is None:
             if self.categorical:
-                left_mask = X[:, feature] == threshold
-                right_mask = X[:, feature] != threshold
+                left_mask = values == threshold
+                right_mask = values != threshold
             else:
-                left_mask = X[:, feature] > threshold
-                right_mask = X[:, feature] <= threshold
+                left_mask = values > threshold
+                right_mask = values <= threshold
         else:
             feature = node.feature
-            values = X[:, feature]
             missing_mask = self._missing_mask(values)
             observed_mask = ~missing_mask
             if node.default_missing_value_direction is self.DefaultMissingValueDirection.LEFT:
@@ -356,17 +398,25 @@ class ANonSeriousDecisionTree:
                         f"Unsupported {self.TreeType}, supported values are {list(self.TreeType)}"
                     )
             return node
+        
+        left_rows_indices = None
+        right_rows_indices = None
+        if row_indices is not None:
+            left_rows_indices = row_indices[left_mask]
+            right_rows_indices = row_indices[right_mask]
 
         node.left = self._build_tree(
             X[left_mask],
             y[left_mask],
             depth=depth + 1,
+            row_indices=left_rows_indices,
             gradient=gradient[left_mask],
             hessian=hessian[left_mask],
         )
         node.right = self._build_tree(
             X[right_mask],
             y[right_mask],
+            row_indices=right_rows_indices,
             depth=depth + 1,
             gradient=gradient[right_mask],
             hessian=hessian[right_mask],
@@ -374,9 +424,19 @@ class ANonSeriousDecisionTree:
 
         return node
 
-    def fit_node(self, node, gradient=None, hessian=None):
-        X = self.X_train_[node.sub_population]
-        y = self.y_train_[node.sub_population]
+    def fit_node(self, node, gradient=None, hessian=None, row_indices=None):
+        if row_indices is None:
+            if node.sub_population is not None:
+                row_indices = np.where(node.sub_population)[0]
+            else:
+                row_indices = np.arange(self.X_train_.shape[0])
+        
+        X = self.X_train_[row_indices]
+        y = self.y_train_[row_indices]
+                
+        if self.xgboost and (gradient is not None and hessian is not None):
+            node.gradient = self.gradient_[row_indices]
+            node.hessian = self.hessian_[row_indices]
 
         node.max_depth = self.str_max_depth
         node.number_of_samples = len(y)
@@ -392,10 +452,6 @@ class ANonSeriousDecisionTree:
 
         _, node.leaf_error = self._leaf_error(y)
         node.number_of_classes = self._class_counts(y)
-
-        if self.xgboost and (gradient is not None and hessian is not None):
-            node.gradient = gradient
-            node.hessian = hessian
 
         if (node.depth >= self.max_depth or len(y) <= self.minimum_population_size) or (
             not self.xgboost and len(set(y)) == 1
@@ -419,7 +475,7 @@ class ANonSeriousDecisionTree:
             case self.TreeType.CLASSIFICATION:
                 feature, threshold = self._classification_split(X, y)
             case self.TreeType.REGRESSION:
-                feature, threshold = self._regression_split(X, y, gradient, hessian)
+                feature, threshold = self._regression_split(X, y, gradient=gradient, hessian=hessian, node=node, row_indices=row_indices)
             case _:
                 raise ValueError(
                     f"Unsupported {self.tree_type}, supported values are {list(self.TreeType)}"
@@ -450,16 +506,15 @@ class ANonSeriousDecisionTree:
         node.threshold = threshold
         node.value = None
 
+        values = self.X_train_[row_indices, feature]
         if node.default_missing_value_direction is None:
             if self.categorical:
-                left_mask = self.X_train_[:, feature] == threshold
-                right_mask = self.X_train_[:, feature] != threshold
+                left_mask = values == threshold
+                right_mask = values != threshold
             else:
-                left_mask = self.X_train_[:, feature] > threshold
-                right_mask = self.X_train_[:, feature] <= threshold
+                left_mask = values > threshold
+                right_mask = values <= threshold
         else:
-            feature = node.feature
-            values = self.X_train_[:, feature]
             missing_mask = self._missing_mask(values)
             observed_mask = ~missing_mask
             if node.default_missing_value_direction is self.DefaultMissingValueDirection.LEFT:
@@ -468,12 +523,12 @@ class ANonSeriousDecisionTree:
             else:
                 left_mask = ((values > threshold) & observed_mask)
                 right_mask = ((values <= threshold) & observed_mask) | missing_mask
-        left_population = node.sub_population & left_mask
-        right_population = node.sub_population & right_mask
+        left_rows = row_indices[left_mask]
+        right_rows = row_indices[right_mask]
 
         if (
-            np.sum(left_population) < self.minimum_split_size
-            or np.sum(right_population) < self.minimum_split_size
+            len(left_rows) < self.minimum_split_size
+            or len(right_rows) < self.minimum_split_size
         ):
             node.is_leaf = True
             match self.tree_type:
@@ -492,17 +547,19 @@ class ANonSeriousDecisionTree:
 
         node.left = ANonSeriousNode()
         node.left.depth = node.depth + 1
-        node.left.sub_population = left_population
+        node.left.sub_population = np.zeros(self.X_train_.shape[0], dtype=bool)
+        node.left.sub_population[left_rows] = True
 
         node.right = ANonSeriousNode()
         node.right.depth = node.depth + 1
-        node.right.sub_population = right_population
+        node.right.sub_population = np.zeros(self.X_train_.shape[0], dtype=bool)
+        node.right.sub_population[right_rows] = True
 
         self.fit_node(
-            node.left, gradient=gradient[left_mask], hessian=hessian[left_mask]
+            node.left, row_indices=left_rows,
         )
         self.fit_node(
-            node.right, gradient=gradient[right_mask], hessian=hessian[right_mask]
+            node.right, row_indices=right_rows,
         )
 
     def purpose_missing_values(
@@ -775,7 +832,7 @@ class ANonSeriousDecisionTree:
 
         return best_feature, best_threshold
 
-    def _regression_split(self, X, y, gradient=None, hessian=None, node=None):
+    def _regression_split(self, X, y, gradient=None, hessian=None, node=None, row_indices=None):
         best_feature = None
         best_threshold = None
         best_score = float("inf")
@@ -797,36 +854,38 @@ class ANonSeriousDecisionTree:
                 best_feature, best_threshold, default_missing_value_direction = self.purpose_missing_values(X=X, gradient=gradient, hessian=hessian, G_parent=G_parent, H_parent=H_parent, best_gain=best_gain, best_feature=best_feature, best_threshold=best_threshold)
                 node.default_missing_value_direction = default_missing_value_direction
                 return best_feature, best_threshold
-        if self.xgboost_optimized:
-            match self.xgboost_split:
-                case self.XGBoostSplit.EXACT:
-                    best_feature, best_threshold = self._xgboost_split_gain_exact(
-                        X=X,
-                        best_feature=best_feature,
-                        best_threshold=best_threshold,
-                        features=features,
-                        gradient=gradient,
-                        hessian=hessian,
-                        G_parent=G_parent,
-                        H_parent=H_parent,
-                        best_gain=best_gain,
-                    )
-                case self.XGBoostSplit.APPROXIMATE:
-                    best_feature, best_threshold = self._xgboost_split_gain_approximate(
-                        X=X,
-                        best_feature=best_feature,
-                        best_threshold=best_threshold,
-                        features=features,
-                        gradient=gradient,
-                        hessian=hessian,
-                        G_parent=G_parent,
-                        H_parent=H_parent,
-                        best_gain=best_gain,
-                    )
-                case _:
-                    raise ValueError(
-                        f"Unsupported {self.XGBoostSplit}, supported values are {list(self.XGBoostSplit)}"
-                    )
+            if self.xgboost_optimized:
+                match self.xgboost_split:
+                    case self.XGBoostSplit.EXACT:
+                        best_feature, best_threshold = self._xgboost_split_gain_exact(
+                            X=X,
+                            best_feature=best_feature,
+                            best_threshold=best_threshold,
+                            features=features,
+                            gradient=gradient,
+                            hessian=hessian,
+                            G_parent=G_parent,
+                            H_parent=H_parent,
+                            best_gain=best_gain,
+                            row_indices=row_indices,
+                        )
+                    case self.XGBoostSplit.APPROXIMATE:
+                        best_feature, best_threshold = self._xgboost_split_gain_approximate(
+                            X=X,
+                            best_feature=best_feature,
+                            best_threshold=best_threshold,
+                            features=features,
+                            gradient=gradient,
+                            hessian=hessian,
+                            G_parent=G_parent,
+                            H_parent=H_parent,
+                            best_gain=best_gain,
+                            row_indices=row_indices,
+                        )
+                    case _:
+                        raise ValueError(
+                            f"Unsupported {self.XGBoostSplit}, supported values are {list(self.XGBoostSplit)}"
+                        )
             return best_feature, best_threshold
 
         if self.random_criterion is not None:
@@ -857,7 +916,7 @@ class ANonSeriousDecisionTree:
                     case self.XGBoostProposal.GLOBAL:
                         thresholds = self.global_candidates[feature]
                     case self.XGBoostProposal.LOCAL:
-                        thresholds = self.propose_candidates(values, hessian)
+                        thresholds = self.propose_candidates(feature=feature, values=values, hessian=hessian, row_indices=row_indices)
                     case _:
                         raise ValueError(
                             f"Unsupported {self.XGBoostProposal}, supported values are {list(self.XGBoostProposal)}"
@@ -914,33 +973,55 @@ class ANonSeriousDecisionTree:
     def _xgboost_split_gain_exact(
         self,
         X,
-        best_feature,
-        best_threshold,
         features,
         gradient,
         hessian,
         G_parent,
         H_parent,
-        best_gain,
+        row_indices=None,
+        best_feature=None,
+        best_threshold=None,
+        best_gain=float("-inf"),
     ):
         for feature in features:
-            values = X[:, feature]
-            order = np.argsort(values)
-            sorted_values = values[order]
-            value_range = len(sorted_values) - 1
-            sorted_gradient = gradient[order]
-            sorted_hessian = hessian[order]
+            if self.preprocess:
+                block = self.preprocessed_columns[feature]
+                sorted_rows = block["rows"]
+                sorted_values = block["values"]
+                
+                node_row_mask = np.zeros(self.X_train_.shape[0], dtype=bool)
+                node_row_mask[row_indices] = True
+                
+                active_mask = node_row_mask[sorted_rows]
+                
+                sorted_rows = sorted_rows[active_mask]
+                sorted_values = sorted_values[active_mask]
+                sorted_gradient = self.gradient_
+                sorted_hessian = self.hessian_
+                value_range = len(sorted_rows) - 1
+                
+                sorted_ids = sorted_rows
+            else:
+                values = X[:, feature]
+                order = np.argsort(values)
+                sorted_values = values[order]
+                value_range = len(sorted_values) - 1
+                sorted_gradient = gradient
+                sorted_hessian = hessian
+                
+                sorted_ids = order
 
             G_right = 0.0
             H_right = 0.0
 
-            for boundary in range(value_range):
-                G_right += sorted_gradient[boundary]
-                H_right += sorted_hessian[boundary]
+            for i in range(value_range):
+                id = sorted_ids[i]
+                G_right += sorted_gradient[id]
+                H_right += sorted_hessian[id]
 
-                if sorted_values[boundary] == sorted_values[boundary + 1]:
+                if sorted_values[i] == sorted_values[i + 1]:
                     continue
-                right_count = boundary + 1
+                right_count = i + 1
                 left_count = len(sorted_values) - right_count
 
                 if (
@@ -963,7 +1044,7 @@ class ANonSeriousDecisionTree:
                     best_gain = gain
                     best_feature = feature
                     best_threshold = (
-                        sorted_values[boundary] + sorted_values[boundary + 1]
+                        sorted_values[i] + sorted_values[i + 1]
                     ) / 2
         if best_gain <= 0:
             return None, None
@@ -972,14 +1053,15 @@ class ANonSeriousDecisionTree:
     def _xgboost_split_gain_approximate(
         self,
         X,
-        best_feature,
-        best_threshold,
         features,
         gradient,
         hessian,
         G_parent,
         H_parent,
-        best_gain,
+        best_feature=None,
+        best_threshold=None,
+        best_gain=float("-inf"),
+        row_indices=None
     ):
         for feature in features:
             values = X[:, feature]
@@ -997,7 +1079,7 @@ class ANonSeriousDecisionTree:
                         )
                     case self.XGBoostProposal.LOCAL:
                         candidates, bucket_G, bucket_H, bucket_count = (
-                            self.weighted_quantile_buckets(values, gradient, hessian)
+                            self.weighted_quantile_buckets(values=values, gradient=gradient, hessian=hessian, feature=feature, row_indices=row_indices)
                         )
                     case _:
                         raise ValueError(
@@ -1081,11 +1163,26 @@ class ANonSeriousDecisionTree:
             - G_parent**2 / (H_parent + self.l2)
         ) - self.gamma)
 
-    def weighted_quantile_candidates(self, values, hessian):
-        order = np.argsort(values)
-        sorted_values = values[order]
-        sorted_hessian = hessian[order]
+    def weighted_quantile_candidates(self, feature, values, hessian, row_indices=None):
+        if self.preprocess:
+            block = self.preprocessed_columns[feature]
+            sorted_rows = block["rows"]
+            sorted_values = block["values"]
+            
+            node_row_mask = np.zeros(self.X_train_.shape[0], dtype=bool)
+            node_row_mask[row_indices] = True
+            active_mask = node_row_mask[sorted_rows]
+            
+            sorted_rows = sorted_rows[active_mask]
+            sorted_values = sorted_values[active_mask]
+            sorted_hessian = self.hessian_[sorted_rows]
+        else:
+            order = np.argsort(values)
+            sorted_values = values[order]
+            sorted_hessian = hessian[order]
 
+        if len(sorted_values) == 0:
+            return np.array([])
         cumulative_weight = np.cumsum(sorted_hessian)
         # total_weight = np.sum(sorted_hessian)
         total_weight = cumulative_weight[-1]
@@ -1113,10 +1210,10 @@ class ANonSeriousDecisionTree:
         )
         return np.sort(candidates)
 
-    def propose_candidates(self, values, hessian):
+    def propose_candidates(self, feature, values, hessian, row_indices=None):
         match self.xgboost_candidate_proposal:
             case self.XGBoostCandidate.WEIGHTED_QUANTILE:
-                candidates = self.weighted_quantile_candidates(values, hessian)
+                candidates = self.weighted_quantile_candidates(feature=feature, values=values, hessian=hessian, row_indices=row_indices)
             case self.XGBoostCandidate.UNWEIGHTED_QUANTILE:
                 candidates = self.unweighted_quantile_candidates(values)
             case self.XGBoostCandidate.RANDOM:
@@ -1127,8 +1224,8 @@ class ANonSeriousDecisionTree:
                 )
         return candidates
 
-    def weighted_quantile_buckets(self, values, gradient, hessian):
-        candidates = self.propose_candidates(values, hessian)
+    def weighted_quantile_buckets(self, values, gradient, hessian, feature, row_indices):
+        candidates = self.propose_candidates(values=values, hessian=hessian, feature=feature, row_indices=row_indices)
         bucket_G, bucket_H, bucket_count = self.bucket_stats_from_candidates(
             values,
             gradient,
