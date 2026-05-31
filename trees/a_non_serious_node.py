@@ -22,6 +22,7 @@ class ANonSeriousNode:
         self.categorical_split = False
         self.gradient = None
         self.hessian = None
+        self.default_missing_value_direction = None
 
     def left_add_prefix(self, text):
         if self.depth > self.max_depth:

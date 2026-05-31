@@ -53,7 +53,7 @@ class ANonSeriousDecisionTree:
     class XGBoostProposal(Enum):
         GLOBAL = 1
         LOCAL = 2
-    
+
     class XGBoostCandidate(Enum):
         WEIGHTED_QUANTILE = 1
         UNWEIGHTED_QUANTILE = 2
@@ -62,6 +62,10 @@ class ANonSeriousDecisionTree:
     class XGBoostSplit(Enum):
         EXACT = 1
         APPROXIMATE = 2
+    
+    class DefaultMissingValueDirection(Enum):
+        RIGHT = 1
+        LEFT = 2
 
     @dataclass
     class TrainDefaults:
@@ -93,6 +97,7 @@ class ANonSeriousDecisionTree:
         xgboost_split=None,
         xgboost_proposal=None,
         xgboost_candidate_proposal=None,
+        missing_value=np.nan,
     ):
         if categorical and vectorized:
             raise RuntimeError("Categorical data can't be used for vectorized search")
@@ -124,6 +129,7 @@ class ANonSeriousDecisionTree:
         self.xgboost_split = xgboost_split
         self.xgboost_proposal = xgboost_proposal
         self.xgboost_candidate_proposal = xgboost_candidate_proposal
+        self.missing_value = missing_value
 
     def __str__(self):
         return str(self.root)
@@ -283,7 +289,7 @@ class ANonSeriousDecisionTree:
             case self.TreeType.CLASSIFICATION:
                 feature, threshold = self._classification_split(X, y)
             case self.TreeType.REGRESSION:
-                feature, threshold = self._regression_split(X, y, gradient, hessian)
+                feature, threshold = self._regression_split(X, y, gradient=gradient, hessian=hessian, node=node)
             case _:
                 raise ValueError(
                     f"Unsupported {self.tree_type}, supported values are {list(self.TreeType)}"
@@ -312,13 +318,25 @@ class ANonSeriousDecisionTree:
         node.feature = feature
         node.threshold = threshold
         node.value = None
-
-        if self.categorical:
-            left_mask = X[:, feature] == threshold
-            right_mask = X[:, feature] != threshold
+        
+        if node.default_missing_value_direction is None:
+            if self.categorical:
+                left_mask = X[:, feature] == threshold
+                right_mask = X[:, feature] != threshold
+            else:
+                left_mask = X[:, feature] > threshold
+                right_mask = X[:, feature] <= threshold
         else:
-            left_mask = X[:, feature] > threshold
-            right_mask = X[:, feature] <= threshold
+            feature = node.feature
+            values = X[:, feature]
+            missing_mask = self._missing_mask(values)
+            observed_mask = ~missing_mask
+            if node.default_missing_value_direction is self.DefaultMissingValueDirection.LEFT:
+                left_mask = ((values > threshold) & observed_mask) | missing_mask
+                right_mask = ((values <= threshold) & observed_mask)
+            else:
+                left_mask = ((values > threshold) & observed_mask)
+                right_mask = ((values <= threshold) & observed_mask) | missing_mask
 
         if (
             len(X[left_mask]) < self.minimum_split_size
@@ -432,12 +450,24 @@ class ANonSeriousDecisionTree:
         node.threshold = threshold
         node.value = None
 
-        if self.categorical:
-            left_mask = self.X_train_[:, feature] == threshold
-            right_mask = self.X_train_[:, feature] != threshold
+        if node.default_missing_value_direction is None:
+            if self.categorical:
+                left_mask = self.X_train_[:, feature] == threshold
+                right_mask = self.X_train_[:, feature] != threshold
+            else:
+                left_mask = self.X_train_[:, feature] > threshold
+                right_mask = self.X_train_[:, feature] <= threshold
         else:
-            left_mask = self.X_train_[:, feature] > threshold
-            right_mask = self.X_train_[:, feature] <= threshold
+            feature = node.feature
+            values = self.X_train_[:, feature]
+            missing_mask = self._missing_mask(values)
+            observed_mask = ~missing_mask
+            if node.default_missing_value_direction is self.DefaultMissingValueDirection.LEFT:
+                left_mask = ((values > threshold) & observed_mask) | missing_mask
+                right_mask = ((values <= threshold) & observed_mask)
+            else:
+                left_mask = ((values > threshold) & observed_mask)
+                right_mask = ((values <= threshold) & observed_mask) | missing_mask
         left_population = node.sub_population & left_mask
         right_population = node.sub_population & right_mask
 
@@ -474,6 +504,172 @@ class ANonSeriousDecisionTree:
         self.fit_node(
             node.right, gradient=gradient[right_mask], hessian=hessian[right_mask]
         )
+
+    def purpose_missing_values(
+        self, 
+        X, 
+        gradient, 
+        hessian, 
+        G_parent, 
+        H_parent, 
+        best_feature=None, 
+        best_threshold=None, 
+        best_gain=float("-inf")
+    ):
+        default_missing_value_direction = None
+
+        number_of_features = X.shape[1]
+        features = np.arange(number_of_features)
+        
+        for feature in features:
+            values = X[:, feature]
+            missing_mask = self._missing_mask(values)
+            observed_values = values[~missing_mask]
+            
+            order = np.argsort(observed_values)
+            observed_indices = np.where(~missing_mask)[0]
+            sorted_observed_indices = observed_indices[order]
+            sorted_values = values[sorted_observed_indices]
+            
+            value_range = len(sorted_values) - 1
+            sorted_gradient = gradient[sorted_observed_indices]
+            sorted_hessian = hessian[sorted_observed_indices]
+
+            best_gain_right, best_threshold_right = self._missing_values_default_right(
+                sorted_values=sorted_values, 
+                value_range=value_range, 
+                sorted_gradient=sorted_gradient, 
+                sorted_hessian=sorted_hessian, 
+                G_parent=G_parent, 
+                H_parent=H_parent, 
+                best_gain=best_gain,
+                best_threshold=best_threshold,
+            )
+            best_gain_left, best_threshold_left = self._missing_values_default_left(
+                sorted_values=sorted_values, 
+                value_range=value_range, 
+                sorted_gradient=sorted_gradient, 
+                sorted_hessian=sorted_hessian, 
+                G_parent=G_parent, 
+                H_parent=H_parent, 
+                best_gain=best_gain,
+                best_threshold=best_threshold,
+            )
+            
+            if best_gain_right is not None and best_gain_right > best_gain:
+                best_feature = feature
+                best_gain = best_gain_right
+                best_threshold = best_threshold_right
+                default_missing_value_direction = self.DefaultMissingValueDirection.RIGHT
+            if best_gain_left is not None and best_gain_left > best_gain:
+                best_feature = feature
+                best_gain = best_gain_left
+                best_threshold = best_threshold_left
+                default_missing_value_direction = self.DefaultMissingValueDirection.LEFT
+        return best_feature, best_threshold, default_missing_value_direction
+
+    def _missing_mask(self, values):
+        if self.missing_value is None:
+            return np.isnan(values)
+        if isinstance(self.missing_value, float) and np.isnan(self.missing_value):
+            return np.isnan(values)   
+        return values == self.missing_value
+
+    def _missing_values_default_left(
+        self,
+        sorted_values,
+        value_range,
+        sorted_gradient,
+        sorted_hessian,
+        G_parent,
+        H_parent,
+        best_threshold=None,
+        best_gain=float("-inf"),
+    ):
+        G_right = 0.0
+        H_right = 0.0
+
+        for boundary in range(value_range):
+            G_right += sorted_gradient[boundary]
+            H_right += sorted_hessian[boundary]
+
+            if sorted_values[boundary] == sorted_values[boundary + 1]:
+                continue
+            right_count = boundary + 1
+            left_count = len(sorted_values) - right_count
+
+            if (
+                left_count < self.minimum_split_size
+                or right_count < self.minimum_split_size
+            ):
+                continue
+            G_left = G_parent - G_right
+            H_left = H_parent - H_right
+
+            gain = self._xgboost_gain(
+                G_parent=G_parent,
+                G_left=G_left,
+                G_right=G_right,
+                H_parent=H_parent,
+                H_left=H_left,
+                H_right=H_right,
+            )
+            if gain > best_gain:
+                best_gain = gain
+                best_threshold = (
+                    sorted_values[boundary] + sorted_values[boundary + 1]
+                ) / 2
+        if best_gain <= 0:
+            return None, None
+        return best_gain, best_threshold
+       
+    def _missing_values_default_right(
+        self, 
+        sorted_values,
+        value_range,
+        sorted_gradient,
+        sorted_hessian,
+        G_parent,
+        H_parent,
+        best_threshold=None,
+        best_gain=float("-inf"),
+    ):
+        G_left = 0.0
+        H_left = 0.0
+
+        for boundary in range(value_range):
+            G_left += sorted_gradient[boundary]
+            H_left += sorted_hessian[boundary]
+
+            if sorted_values[boundary] == sorted_values[boundary + 1]:
+                continue
+            left_count = boundary + 1
+            right_count = len(sorted_values) - left_count
+
+            if (
+                right_count < self.minimum_split_size
+                or left_count < self.minimum_split_size
+            ):
+                continue
+            G_right = G_parent - G_left
+            H_right = H_parent - H_left
+
+            gain = self._xgboost_gain(
+                G_parent=G_parent,
+                G_left=G_left,
+                G_right=G_right,
+                H_parent=H_parent,
+                H_left=H_left,
+                H_right=H_right,
+            )
+            if gain > best_gain:
+                best_gain = gain
+                best_threshold = (
+                    sorted_values[boundary] + sorted_values[boundary + 1]
+                ) / 2
+        if best_gain <= 0:
+            return None, None
+        return best_gain, best_threshold
 
     def _classification_split(self, X, y):
         best_feature = None
@@ -579,7 +775,7 @@ class ANonSeriousDecisionTree:
 
         return best_feature, best_threshold
 
-    def _regression_split(self, X, y, gradient=None, hessian=None):
+    def _regression_split(self, X, y, gradient=None, hessian=None, node=None):
         best_feature = None
         best_threshold = None
         best_score = float("inf")
@@ -597,7 +793,10 @@ class ANonSeriousDecisionTree:
             best_gain = float("-inf")
             G_parent = np.sum(gradient)
             H_parent = np.sum(hessian)
-
+            if self.purpose_missing and self.missing_value is not None and node is not None:
+                best_feature, best_threshold, default_missing_value_direction = self.purpose_missing_values(X=X, gradient=gradient, hessian=hessian, G_parent=G_parent, H_parent=H_parent, best_gain=best_gain, best_feature=best_feature, best_threshold=best_threshold)
+                node.default_missing_value_direction = default_missing_value_direction
+                return best_feature, best_threshold
         if self.xgboost_optimized:
             match self.xgboost_split:
                 case self.XGBoostSplit.EXACT:
@@ -854,8 +1053,7 @@ class ANonSeriousDecisionTree:
         best_threshold,
         best_gain,
     ):
-        # G_left = np.sum(gradient[left_mask])
-        # H_left = np.sum(hessian[left_mask])
+        # G_left = np.sum(gradient[left_mask]) H_left = np.sum(hessian[left_mask])
         G_right = np.sum(gradient[right_mask])
         H_right = np.sum(hessian[right_mask])
 
@@ -877,16 +1075,11 @@ class ANonSeriousDecisionTree:
         return best_feature, best_threshold, best_gain
 
     def _xgboost_gain(self, G_parent, G_left, G_right, H_parent, H_left, H_right):
-        return (
-            1
-            / 2
-            * (
-                G_left**2 / (H_left + self.l2)
-                + G_right**2 / (H_right + self.l2)
-                - G_parent**2 / (H_parent + self.l2)
-            )
-            - self.gamma
-        )
+        return (1 / 2 * (
+            G_left**2 / (H_left + self.l2)
+            + G_right**2 / (H_right + self.l2)
+            - G_parent**2 / (H_parent + self.l2)
+        ) - self.gamma)
 
     def weighted_quantile_candidates(self, values, hessian):
         order = np.argsort(values)
@@ -919,7 +1112,7 @@ class ANonSeriousDecisionTree:
             replace=False,
         )
         return np.sort(candidates)
-    
+
     def propose_candidates(self, values, hessian):
         match self.xgboost_candidate_proposal:
             case self.XGBoostCandidate.WEIGHTED_QUANTILE:
@@ -929,7 +1122,9 @@ class ANonSeriousDecisionTree:
             case self.XGBoostCandidate.RANDOM:
                 candidates = self.random_candidate_thresholds(values)
             case _:
-                raise ValueError(f"Unsupported {self.XGBoostCandidate}, supported values are {list(self.XGBoostCandidate)}")
+                raise ValueError(
+                    f"Unsupported {self.XGBoostCandidate}, supported values are {list(self.XGBoostCandidate)}"
+                )
         return candidates
 
     def weighted_quantile_buckets(self, values, gradient, hessian):
@@ -1399,7 +1594,12 @@ class ANonSeriousDecisionTree:
             if leaf_node:
                 return node
             return node.value
-
+        
+        if self._is_missing_scalar(x[node.feature]):
+            if node.default_missing_value_direction is self.DefaultMissingValueDirection.LEFT:
+                return self.predict_one(x, node.left, leaf_node=leaf_node)
+            else:
+                return self.predict_one(x, node.right, leaf_node=leaf_node)
         if self.categorical:
             if x[node.feature] == node.threshold:
                 return self.predict_one(x, node.left, leaf_node=leaf_node)
@@ -1410,6 +1610,13 @@ class ANonSeriousDecisionTree:
                 return self.predict_one(x, node.left, leaf_node=leaf_node)
             else:
                 return self.predict_one(x, node.right, leaf_node=leaf_node)
+
+    def _is_missing_scalar(self, value):
+        if self.missing_value is None:
+            return np.isnan(value)
+        if isinstance(self.missing_value, float) and np.isnan(self.missing_value):
+            return np.isnan(value)
+        return value == self.missing_value
 
     def predict(self, X):
         if self.vectorized:

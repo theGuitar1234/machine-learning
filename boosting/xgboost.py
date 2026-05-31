@@ -44,14 +44,18 @@ class XGBoost:
         early_stopping=False,
         restore_best=False,
         log=False,
+        purpose_missing=False,
         config=None,
         candidate_proposal=None,
         missing_value=None,
+        vectorized=False,
     ):
         if not (0 < sub_sample <= 1) or not (0 < column_sub_sample <= 1):
             raise ValueError(
                 "sub_sample and column_sub_sample must be a positive fraction less than 1"
             )
+        if vectorized and purpose_missing:
+            raise RuntimeError("Vectorized Split Search can't handle missing values")
         if config is None:
             config = self.TrainDefaults()
         self.config = config
@@ -74,6 +78,7 @@ class XGBoost:
         self.xgboost_split = xgboost_split
         self.candidate_proposal = candidate_proposal
         self.missing_value = missing_value
+        self.purpose_missing = purpose_missing
 
     def fit(self, X, y, X_val, y_val, optimized=False):
         self.X_train_ = X
@@ -130,7 +135,7 @@ class XGBoost:
                 random_criterion=self.random_criterion,
                 tree_type=self.tree_type,
                 xgboost=True,
-                vectorized=True,
+                vectorized=False,
                 xgboost_split=self.xgboost_split,
                 xgboost_proposal=self.proposal,
                 xgboost_candidate_proposal=self.candidate_proposal,
@@ -138,7 +143,8 @@ class XGBoost:
             tree.xgboost_optimized = optimized
             tree.l2 = self.config.l2
             tree.gamma = self.config.gamma
-            tree.missing_value = missing_value
+            tree.missing_value = self.missing_value
+            tree.purpose_missing = self.purpose_missing
 
             pseudo_residual = -self.dloss(y, self.F_x)
             match self.loss_type:
@@ -452,15 +458,15 @@ if __name__ == "__main__":
     )
     
     missing_value = np.nan
-    # n_missing = 15
-    # missing_indices = np.random.choice(
-    #     X_train.shape[0],
-    #     size=n_missing,
-    #     replace=False,
-    # )
-    # X_train[missing_indices] = missing_value
-    # y_train[missing_indices] = missing_value
-  
+    n_missing = 15
+
+    missing_indices = np.random.choice(
+        X_train.shape[0],
+        size=n_missing,
+        replace=False,
+    )
+    X_train[missing_indices] = missing_value
+
     xgboost = XGBoost(
         loss_type=XGBoost.LossType.SSE,
         restore_best=True,
@@ -470,6 +476,8 @@ if __name__ == "__main__":
         proposal=ANonSeriousDecisionTree.XGBoostProposal.LOCAL,
         candidate_proposal=ANonSeriousDecisionTree.XGBoostCandidate.WEIGHTED_QUANTILE,
         missing_value=missing_value,
+        purpose_missing=True,
+        vectorized=False,
     )
     xgboost.fit(X_train, y_train, X_val, y_val, optimized=True)
 
