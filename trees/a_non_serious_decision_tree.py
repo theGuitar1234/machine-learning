@@ -402,21 +402,31 @@ class ANonSeriousDecisionTree:
             left_rows_indices = row_indices[left_mask]
             right_rows_indices = row_indices[right_mask]
 
+        gradient_left = None
+        hessian_left = None
+        gradient_right = None
+        hessian_right = None
+
+        if self.xgboost and (gradient is not None and hessian is not None):
+            gradient_left = gradient[left_mask]
+            hessian_left = hessian[left_mask]
+            gradient_right = gradient[right_mask]
+            hessian_right = hessian[right_mask]
         node.left = self._build_tree(
             X[left_mask],
             y[left_mask],
             depth=depth + 1,
             row_indices=left_rows_indices,
-            gradient=gradient[left_mask],
-            hessian=hessian[left_mask],
+            gradient=gradient_left,
+            hessian=hessian_left,
         )
         node.right = self._build_tree(
             X[right_mask],
             y[right_mask],
             row_indices=right_rows_indices,
             depth=depth + 1,
-            gradient=gradient[right_mask],
-            hessian=hessian[right_mask],
+            gradient=gradient_right,
+            hessian=hessian_right,
         )
 
         return node
@@ -793,7 +803,7 @@ class ANonSeriousDecisionTree:
                         __right = self.entropy(right_group)
                     case _:
                         raise ValueError(
-                            f"Unsupported Information Gain, supported values are {list(self.InformationGain)}"
+                            f"Unsupported {self.information_gain}, supported values are {list(self.InformationGain)}"
                         )
 
                 _weighted_impurity = self.weighted_impurity(
@@ -2179,3 +2189,25 @@ class ANonSeriousDecisionTree:
         )
         final_tree.fit(X_train_val, y_train_val, verbose=verbose)
         return final_tree
+
+if __name__ == "__main__":
+    from boosting.generate_categories import create_categorical_dataset
+
+    X, y = create_categorical_dataset(n_samples=300, seed=42)
+    X = np.asarray(X)
+    y = np.asarray(y)
+    
+    tree = ANonSeriousDecisionTree(
+        max_depth=10,
+        minimum_population_size=2,
+        minimum_gain=0.001,
+        categorical=True,
+        adjacent=False,
+        information_gain=ANonSeriousDecisionTree.InformationGain.GINI,
+        tree_type=ANonSeriousDecisionTree.TreeType.CLASSIFICATION,
+    )
+    
+    tree.fit(X, y, verbose=True)
+    
+    tree.visualize_tree(2, 3)
+    

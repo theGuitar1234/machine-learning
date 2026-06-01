@@ -31,8 +31,9 @@ class GradientBoosting:
         column_sub_sample=1,
         early_stopping=False,
         restore_best=False,
+        validation=False,
     ):
-        if sub_sample%1 != 0 or column_sub_sample%1 != 0:
+        if not (0 < sub_sample <= 1) and not (0 < column_sub_sample <= 1):
             raise ValueError("sub_sample and column_sub_sample must be a positive fraction less than 1")
         self.sub_sample = sub_sample
         self.column_sub_sample = column_sub_sample
@@ -49,6 +50,7 @@ class GradientBoosting:
         self.loss_type = loss_type
         self.early_stopping = early_stopping
         self.restore_best = restore_best
+        self.validation = validation
 
     def fit(self, X, y, X_val, y_val, epsilon=1e-12):
         self.X_train_ = X
@@ -106,17 +108,18 @@ class GradientBoosting:
             self.feature_indices.append(feature_indices)
             self.F_x += self.learning_rate * tree.predict(X[:, feature_indices])
             
-            _, val_loss = self.evaluate_dataset(X_val, y_val)
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_round = round
-                patience_counter = 0
-                best_number_of_trees = len(self.trees)
-            else:
-                patience_counter += 1
-            if self.early_stopping and patience_counter >= patience:
-                print("Overfitting detected. Early stopping at round: ", round, "Best Round : ", best_round)
-                break
+            if self.validation:
+                _, val_loss = self.evaluate_dataset(X_val, y_val)
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_round = round
+                    patience_counter = 0
+                    best_number_of_trees = len(self.trees)
+                else:
+                    patience_counter += 1
+                if self.early_stopping and patience_counter >= patience:
+                    print("Overfitting detected. Early stopping at round: ", round, "Best Round : ", best_round)
+                    break
         if self.restore_best:
             self.trees = self.trees[:best_number_of_trees]
             self.feature_indices = self.feature_indices[:best_number_of_trees]
@@ -209,7 +212,7 @@ class GradientBoosting:
         return prediction
     
     def visualize(self):
-        if self.X_train_ or self.y_train_ is None:
+        if self.X_train_ is None or self.y_train_ is None:
             raise RuntimeError("Model is not fit")
         os.makedirs("img", exist_ok=True)
         X = self.X_train_
