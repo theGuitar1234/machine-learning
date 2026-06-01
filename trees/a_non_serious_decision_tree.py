@@ -70,7 +70,6 @@ class ANonSeriousDecisionTree:
     @dataclass
     class TrainDefaults:
         epsilon: float = 1e-5
-        l2: float = 0.5
         max_xgboost_bins: int = 32
 
     def __init__(
@@ -101,8 +100,7 @@ class ANonSeriousDecisionTree:
         preprocess=False,
         xgboost_optimized=False,
         purpose_missing=False,
-        l2=None,
-        gamma=0.0,
+        batch_training=False,
     ):
         if categorical and vectorized:
             raise RuntimeError("Categorical data can't be used for vectorized search")
@@ -140,8 +138,7 @@ class ANonSeriousDecisionTree:
         self.preprocess = preprocess
         self.xgboost_optimized = xgboost_optimized
         self.purpose_missing = purpose_missing
-        self.l2 = config.l2 if l2 is None else l2
-        self.gamma = gamma
+        self.batch_training = batch_training
         self.preprocessed_columns = None
         self.global_candidates = None
 
@@ -243,7 +240,7 @@ class ANonSeriousDecisionTree:
             self.root.is_root = True
             self.root.depth = 0
             self.root.sub_population = np.ones(self.X_train_.shape[0], dtype=bool)
-            self.fit_node(self.root, gradient, hessian)
+            self.fit_node(node=self.root, gradient=gradient, hessian=hessian, row_indices=root_row_indices)
         else:
             self.root = self._build_tree(
                 self.X_train_, self.y_train_, depth=0, row_indices=root_row_indices, gradient=self.gradient_, hessian=self.hessian_
@@ -936,7 +933,7 @@ class ANonSeriousDecisionTree:
                         self._xgboost_split_gain_unoptimized(
                             gradient=gradient,
                             hessian=hessian,
-                            left_mask=left_mask,
+                            # left_mask=left_mask,
                             right_mask=right_mask,
                             feature=feature,
                             threshold=threshold,
@@ -1014,16 +1011,129 @@ class ANonSeriousDecisionTree:
             G_right = 0.0
             H_right = 0.0
 
-            for i in range(value_range):
-                id = sorted_ids[i]
-                G_right += sorted_gradient[id]
-                H_right += sorted_hessian[id]
+            if self.batch_training:
+                best_feature, best_threshold, best_gain = self._xgboost_batch_split_exact(
+                    sorted_ids=sorted_ids,
+                    sorted_gradient=sorted_gradient,
+                    sorted_hessian=sorted_hessian,
+                    sorted_values=sorted_values,
+                    G_parent=G_parent,
+                    H_parent=H_parent,
+                    feature=feature,
+                    G_right=G_right,
+                    H_right=H_right,
+                    best_feature=best_feature,
+                    best_threshold=best_threshold,
+                    best_gain=best_gain,
+                )
+            else:
+                best_feature, best_threshold, best_gain = self._xgboost_split_exact(
+                    value_range=value_range,
+                    sorted_ids=sorted_ids,
+                    sorted_gradient=sorted_gradient,
+                    sorted_hessian=sorted_hessian,
+                    sorted_values=sorted_values,
+                    G_parent=G_parent,
+                    H_parent=H_parent,
+                    feature=feature,
+                    G_right=G_right,
+                    H_right=H_right,
+                    best_feature=best_feature,
+                    best_threshold=best_threshold,
+                    best_gain=best_gain,
+                )
+        if best_gain <= 0:
+            return None, None
+        return best_feature, best_threshold
 
-                if sorted_values[i] == sorted_values[i + 1]:
+    def _xgboost_split_exact(
+        self,
+        value_range,
+        sorted_ids,
+        sorted_gradient,
+        sorted_hessian,
+        sorted_values,
+        G_parent,
+        H_parent,
+        feature,
+        G_right,
+        H_right,
+        best_feature=None,
+        best_threshold=None,
+        best_gain=None,
+    ):
+        for i in range(value_range):
+            id = sorted_ids[i]
+            G_right += sorted_gradient[id]
+            H_right += sorted_hessian[id]
+
+            if sorted_values[i] == sorted_values[i + 1]:
+                continue
+            right_count = i + 1
+            left_count = len(sorted_values) - right_count
+
+            if (
+                left_count < self.minimum_split_size
+                or right_count < self.minimum_split_size
+            ):
+                continue
+            G_left = G_parent - G_right
+            H_left = H_parent - H_right
+
+            gain = self._xgboost_gain(
+                G_parent=G_parent,
+                G_left=G_left,
+                G_right=G_right,
+                H_parent=H_parent,
+                H_left=H_left,
+                H_right=H_right,
+            )
+            if gain > best_gain:
+                best_gain = gain
+                best_feature = feature
+                best_threshold = (
+                    sorted_values[i] + sorted_values[i + 1]
+                ) / 2
+        return best_feature, best_threshold, best_gain
+    
+    def _xgboost_batch_split_exact(
+        self,
+        sorted_ids,
+        sorted_gradient,
+        sorted_hessian,
+        sorted_values,
+        G_parent,
+        H_parent,
+        feature,
+        G_right,
+        H_right,
+        best_feature=None,
+        best_threshold=None,
+        best_gain=None,
+    ):
+        number_of_rows = len(sorted_ids)
+        batch_size = self.batch_size
+        for batch_start in range(0, number_of_rows - 1, batch_size):
+            batch_end = min(batch_start + batch_size, number_of_rows - 1)
+            
+            row_id_buffer = sorted_ids[batch_start:batch_end]
+            
+            g_buffer = sorted_gradient[row_id_buffer]
+            h_buffer = sorted_hessian[row_id_buffer]
+            
+            value_buffer = sorted_values[batch_start:batch_end]
+            next_value_buffer = sorted_values[batch_start + 1:batch_end + 1]
+            
+            for j in range(batch_end - batch_start):
+                i = batch_start + j
+                G_right += g_buffer[j]
+                H_right += h_buffer[j]
+                
+                if value_buffer[j] == next_value_buffer[j]:
                     continue
                 right_count = i + 1
                 left_count = len(sorted_values) - right_count
-
+                
                 if (
                     left_count < self.minimum_split_size
                     or right_count < self.minimum_split_size
@@ -1031,7 +1141,7 @@ class ANonSeriousDecisionTree:
                     continue
                 G_left = G_parent - G_right
                 H_left = H_parent - H_right
-
+                
                 gain = self._xgboost_gain(
                     G_parent=G_parent,
                     G_left=G_left,
@@ -1043,12 +1153,11 @@ class ANonSeriousDecisionTree:
                 if gain > best_gain:
                     best_gain = gain
                     best_feature = feature
-                    best_threshold = (
-                        sorted_values[i] + sorted_values[i + 1]
-                    ) / 2
-        if best_gain <= 0:
-            return None, None
-        return best_feature, best_threshold
+                    best_threshold = (value_buffer[j] + next_value_buffer[j]) / 2
+                    # best_threshold = (
+                    #     sorted_values[i] + sorted_values[i + 1]
+                    # ) / 2
+        return best_feature, best_threshold, best_gain
 
     def _xgboost_split_gain_approximate(
         self,
@@ -1125,7 +1234,7 @@ class ANonSeriousDecisionTree:
         self,
         gradient,
         hessian,
-        left_mask,
+        # left_mask,
         right_mask,
         feature,
         threshold,

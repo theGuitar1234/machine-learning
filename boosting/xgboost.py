@@ -24,6 +24,7 @@ class XGBoost:
         learning_rate: float = 0.03
         validation_tolerance: float = 10
         patience: int = 100
+        batch_size: int = 50
 
     def __init__(
         self,
@@ -50,6 +51,7 @@ class XGBoost:
         missing_value=None,
         vectorized=False,
         preprocess=False,
+        batch_training=False,
     ):
         if not (0 < sub_sample <= 1) or not (0 < column_sub_sample <= 1):
             raise ValueError(
@@ -81,6 +83,7 @@ class XGBoost:
         self.missing_value = missing_value
         self.purpose_missing = purpose_missing
         self.preprocess = preprocess
+        self.batch_training = batch_training
 
     def fit(self, X, y, X_val, y_val, optimized=False):
         self.X_train_ = X
@@ -142,12 +145,15 @@ class XGBoost:
                 xgboost_proposal=self.proposal,
                 xgboost_candidate_proposal=self.candidate_proposal,
                 xgboost_optimized = optimized,
-                l2 = self.config.l2,
-                gamma = self.config.gamma,
                 missing_value = self.missing_value,
                 purpose_missing = self.purpose_missing,
                 preprocess = self.preprocess,
+                batch_training = self.batch_training,
             )
+            
+            tree.l2 = self.config.l2
+            tree.gamma = self.config.gamma
+            tree.batch_size = self.config.batch_size
 
             pseudo_residual = -self.dloss(y, self.F_x)
             match self.loss_type:
@@ -482,6 +488,7 @@ if __name__ == "__main__":
         purpose_missing=False,
         vectorized=True,
         preprocess=False,
+        batch_training=True,
     )
     xgboost.fit(X_train, y_train, X_val, y_val, optimized=True)
 
