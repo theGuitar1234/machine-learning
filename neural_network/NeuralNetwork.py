@@ -1,0 +1,2375 @@
+#!/usr/bin/env python3
+
+import os
+import csv
+import copy
+import json
+import time
+import pickle
+import matplotlib.pyplot as plt
+
+from enum import Enum
+from dataclasses import dataclass
+from datetime import datetime
+
+import numpy as np
+
+try:
+    import cupy as cp
+except ImportError:
+    cp = None
+
+
+class NeuralNetwork:
+
+    class LayerStrategies(Enum):
+        CONSTANT_WIDTH = 1
+        LINEAR_TAPER_FUNNEL = 2
+        LINEAR_TAPER_FUNNEL_OUTPUT = 3
+        GEOMETRIC_TAPER = 4
+        EXPANSION_COMPRESSION = 5
+        BOTTLENECK_HOURGLASS = 6
+        POWER_OF_TWO = 7
+        REVERSE_POWER_OF_TWO = 8
+        PARAMETER_BUDGET = 9
+
+    class StartWidthHeuristics(Enum):
+        INPUT_WIDTH = 1
+        CAPPED_INPUT_WIDTH = 2
+        OUTPUT_AWARE = 3
+
+    class WeightInitStrategy(Enum):
+        XAVIER_NORMAL = 1
+        XAVIER_UNIFORM = 2
+        HE_NORMAL = 3
+        HE_UNIFORM = 4
+        LECUN_NORMAL = 5
+        LECUN_UNIFORM = 6
+        ZERO = 7
+
+    class BiasInitStrategy(Enum):
+        ZERO = 1
+        CONSTANT = 2
+        NORMAL = 3
+        UNIFORM = 4
+
+    class LossType(Enum):
+        MSE = 1
+        MULTI_CLASS_CROSS_ENTROPY = 2
+        BINARY_CROSS_ENTROPY = 3
+
+    class DataAugmentation(Enum):
+        JITTER_NOISE = 1
+        SAME_CLASS_INTERPOLATION = 2
+        MEASUREMENT_NOISE = 3
+
+    class HiddenActivationType(Enum):
+        SIGMOID = 1
+        RELU = 2
+        LEAKY_RELU = 3
+        TANH = 4
+
+    class OutputActivationType(Enum):
+        SIGMOID = 1
+        SOFTMAX = 2
+
+    class LearningDecayType(Enum):
+        STEP_DECAY = 1
+        INVERSE_DECAY = 2
+        EXPONENTIAL_DECAY = 3
+
+    class Optimizers(Enum):
+        GDC = 1
+        MOMENTUM = 2
+        RMS_PROP = 3
+        ADAM = 4
+
+    class Datasets(Enum):
+        NPZ = 1
+        JSON = 2
+        PICKLE = 3
+
+    class Device(Enum):
+        CPU = 1
+        GPU = 2
+
+    @dataclass
+    class TrainDefaults:
+        learning_rate: float = 1e-2
+        epochs: int = 5000
+        reg: float = 1e-4
+        epsilon: float = 1e-8
+        step: int = 100
+        threshold: float = 0.5
+        drop_out_rate: float = 0.03
+        l2_lambda: float = 0.03
+        batch_size: int = 512
+        patience: int = 100
+        decay_factor: float = 0.5
+        seed: int = 42
+        start_width_heuristic_cap: int = 512
+        output_aware_multiplier: int = 4
+        expansion_multiplier: int = 2
+        momentum_coefficient: float = 0.9
+        rms_coefficient: float = 0.999
+        prediction_tolerance: int = 100
+        validation_tolerance: float = 0.005
+        prediction_threshold: int = 1000
+        default_format_version: str = "1.0.0"
+
+    @dataclass
+    class TrainResults:
+        losses: list = None
+        val_losses: list = None
+        best_val_loss: float = 0.0
+        val_accuracies: list = None
+        best_epoch: int = 0
+        final_loss: float = 0.0
+        accuracy: float = 0.0
+        final_learning_rate: float = 0.0
+        figure_title: str = "Training Results"
+
+    @dataclass
+    class ConfusionMatrix:
+        TP: str = "TP"
+        FP: str = "FP"
+        TN: str = "TN"
+        FN: str = "FN"
+        space: int = " "
+        padding: int = 1
+
+    @dataclass
+    class ErrorAnalysis:
+        tp: str = "True Positives"
+        fp: str = "False Positives"
+        tn: str = "True Negatives"
+        fn: str = "False Negatives"
+        acc: str = "Accuracy"
+        per: str = "Percision"
+        rec: str = "Recall"
+        spec: str = "Specificity"
+        f1: str = "F1 Score"
+        fpr: str = "False Positive Rate"
+        fnr: str = "False Negative Rate"
+        tnr: str = "True Negative Rate"
+        tpr: str = "True Positive Rate"
+        bal_acc: str = "Balanced Accuracy"
+        mcc: str = "Matthews Correlation Coefficient MCC"
+        iou: str = "Jaccart Index IoU"
+
+    @dataclass
+    class Paths:
+        model_path: str = "models/"
+        csv_path: str = "data/csv/"
+        npz_path: str = "data/npz/"
+        json_path: str = "data/json/"
+        pickle_path: str = "data/pickle/"
+        default_data: str = "Untitled"
+        prediction_path: str = "data/prediction/"
+        error_analysis_path: str = "data/error_analysis/"
+        confusion_matrix_path: str = "data/confusion_matrix/"
+        test_prediction_file: str = "test_predictions"
+        validation_prediction_file: str = "validation_predictions"
+        train_prediction_file: str = "train_predictions"
+        error_analysis_file: str = "error_analysis"
+        confusion_matrix_file: str = "confusion_matrix"
+
+    @dataclass
+    class Extensions:
+        csv: str = ".csv"
+        npz: str = ".npz"
+        json: str = ".json"
+        pickle: str = ".pkl"
+        text: str = ".txt"
+
+    @dataclass
+    class Encodings:
+        UTF_8: str = "utf_8"
+
+    def __init__(
+        self,
+        number_of_features,
+        number_of_classes,
+        layers,
+        loss_type=None,
+        output_activation_type=None,
+        hidden_activation_type=None,
+        hidden_weight_init_strategy=None,
+        output_weight_init_strategy=None,
+        bias_init_strategy=None,
+        init_seed=None,
+        init_random_range=None,
+        hidden_bias_value=0.0,
+        output_positive_prior=None,
+        device=Device.CPU,
+        config=None,
+    ):
+        if type(number_of_features) is not int:
+            raise TypeError("number_of_features must be an integer")
+        if number_of_features < 1:
+            raise ValueError("number_of_features must be a positive integer")
+        if type(layers) is not list or len(layers) == 0:
+            raise TypeError("layers must be a list of positive integers")
+
+        for nodes in layers:
+            if type(nodes) is not int or nodes < 1:
+                raise TypeError("layers must be a list of positive integers")
+
+        if loss_type is None:
+            match output_activation_type:
+                case self.OutputActivationType.SIGMOID:
+                    loss_type = self.LossType.BINARY_CROSS_ENTROPY
+                case self.OutputActivationType.SOFTMAX:
+                    loss_type = self.LossType.MULTI_CLASS_CROSS_ENTROPY
+                case _:
+                    raise ValueError(
+                        f"Unknown Output Activation Type, supported values are : {self.OutputActivationType.SIGMOID}, {self.OutputActivationType.SOFTMAX}"
+                    )
+        if loss_type not in self.LossType:
+            raise ValueError(
+                f"loss_type must be {self.LossType.MSE}, {self.LossType.BINARY_CROSS_ENTROPY}, {self.LossType.MULTI_CLASS_CROSS_ENTROPY}"
+            )
+        if output_activation_type is self.OutputActivationType.SIGMOID:
+            allowed_losses = {self.LossType.BINARY_CROSS_ENTROPY, self.LossType.MSE}
+        elif output_activation_type is self.OutputActivationType.SOFTMAX:
+            allowed_losses = {
+                self.LossType.MULTI_CLASS_CROSS_ENTROPY,
+                self.LossType.MSE,
+            }
+        else:
+            raise ValueError(
+                f"Unknown Output Activation Type, supported values are: "
+                f"{self.OutputActivationType.SIGMOID}, {self.OutputActivationType.SOFTMAX}"
+            )
+
+        if loss_type not in allowed_losses:
+            raise ValueError(
+                f"Incompatible loss_type {loss_type} for output_activation_type "
+                f"{output_activation_type}"
+            )
+
+        if output_activation_type not in self.OutputActivationType:
+            raise ValueError(
+                f"output_activation_type must be {self.OutputActivationType.SIGMOID}, {self.OutputActivationType.SOFTMAX}"
+            )
+        if hidden_activation_type not in self.HiddenActivationType:
+            raise ValueError(
+                f"hidden_activation_type must be {self.HiddenActivationType.SIGMOID}, {self.HiddenActivationType.RELU}, {self.HiddenActivationType.LEAKY_RELU}, {self.HiddenActivationType.TANH}"
+            )
+
+        if (
+            hidden_weight_init_strategy is not None
+            and hidden_weight_init_strategy not in self.WeightInitStrategy
+        ):
+            raise ValueError(
+                f"hidden_weight_init_strategy must be one of {list(self.WeightInitStrategy)}"
+            )
+
+        if (
+            output_weight_init_strategy is not None
+            and output_weight_init_strategy not in self.WeightInitStrategy
+        ):
+            raise ValueError(
+                f"output_weight_init_strategy must be one of {list(self.WeightInitStrategy)}"
+            )
+
+        if hidden_weight_init_strategy is None:
+            hidden_weight_init_strategy = self.default_hidden_weight_init_strategy(
+                hidden_activation_type
+            )
+
+        if output_weight_init_strategy is None:
+            output_weight_init_strategy = self.default_output_weight_init_strategy(
+                output_activation_type
+            )
+
+        if bias_init_strategy is None:
+            bias_init_strategy = self.BiasInitStrategy.ZERO
+        elif bias_init_strategy not in self.BiasInitStrategy:
+            raise ValueError(
+                f"bias_init_strategy must be one of {list(self.BiasInitStrategy)}"
+            )
+
+        if hidden_bias_value is None:
+            hidden_bias_value = 0.0
+        if not isinstance(hidden_bias_value, (int, float, np.floating)):
+            raise TypeError("hidden_bias_value must be a float")
+        hidden_bias_value = float(hidden_bias_value)
+
+        if init_seed is not None and init_random_range is not None:
+            raise ValueError("Provide either init_seed or init_rng, not both")
+        if init_random_range is not None and not isinstance(
+            init_random_range, np.random.Generator
+        ):
+            raise TypeError("init_rng must be a numpy.random.Generator")
+
+        if output_positive_prior is not None:
+            if not isinstance(output_positive_prior, (int, float, np.floating)):
+                raise TypeError("output_positive_prior must be a float")
+            output_positive_prior = float(output_positive_prior)
+            if not (0.0 < output_positive_prior < 1.0):
+                raise ValueError(
+                    "output_positive_prior must be strictly between 0 and 1"
+                )
+
+        match device:
+            case self.Device.CPU:
+                self.on_gpu = False
+            case self.Device.GPU:
+                if cp is None:
+                    raise RuntimeError(
+                        "CuPy is not installed. Install a CUDA-enabled CuPy package first"
+                    )
+                self.on_gpu = True
+            case _:
+                raise ValueError("UnSupported Device Type")
+
+        if self.on_gpu:
+            self.__init_random_range = (
+                init_random_range
+                if init_random_range is not None
+                else cp.random.default_rng(init_seed)
+            )
+        else:
+            self.__init_random_range = (
+                init_random_range
+                if init_random_range is not None
+                else np.random.default_rng(init_seed)
+            )
+
+        self.__number_of_features = number_of_features
+        self.__number_of_classes = number_of_classes
+        self.__L = len(layers)
+        self.__cache = []
+        self.__WB = []
+        self.__input_width = number_of_features
+        self.__layers = layers.copy()
+        self.__loss_type = loss_type
+        self.__output_activation_type = output_activation_type
+        self.__hidden_activation_type = hidden_activation_type
+        self.__config = config
+
+        for i in range(self.__L):
+            fan_in = number_of_features if i == 0 else layers[i - 1]
+            fan_out = layers[i]
+
+            current_weight_init_strategy = (
+                output_weight_init_strategy
+                if i == self.__L - 1
+                else hidden_weight_init_strategy
+            )
+
+            current_alpha = 0.0
+            if (
+                i != self.__L - 1
+                and self.__hidden_activation_type
+                == self.HiddenActivationType.LEAKY_RELU
+            ):
+                current_alpha = 0.01
+
+            random_weights = self.init_weights(
+                fan_out,
+                fan_in,
+                current_weight_init_strategy,
+                rng=self.__init_random_range,
+                alpha=current_alpha,
+            )
+
+            random_biases = self.init_biases(
+                fan_out,
+                bias_init_strategy,
+                rng=self.__init_random_range,
+                is_output_layer=(i == self.__L - 1),
+                hidden_activation_type=self.__hidden_activation_type,
+                output_activation_type=self.__output_activation_type,
+                hidden_bias_value=hidden_bias_value,
+                output_positive_prior=output_positive_prior,
+            )
+
+            random_weights = self.to_device(random_weights, dtype=self.xp.float32)
+            random_biases = self.to_device(random_biases, dtype=self.xp.float32)
+
+            self.__WB.append((random_weights, random_biases))
+
+    def scalar_to_python(self, x):
+        if self.on_gpu:
+            return float(cp.asnumpy(x))
+        return float(x)
+
+    def to_cpu_WB(self):
+        if not self.on_gpu:
+            return self.__WB
+        return [(cp.asnumpy(W), cp.asnumpy(b)) for W, b in self.__WB]
+
+    def cpu_to_cuda_WB(self, WB):
+        if self.on_gpu:
+            return [(cp.asarray(W), cp.asarray(b)) for W, b in WB]
+        return [(np.asarray(W), np.asarray(b)) for W, b in WB]
+
+    def to_device(self, x, dtype=None):
+        if self.on_gpu:
+            return cp.asarray(x, dtype=dtype)
+        return np.asarray(x, dtype=dtype)
+
+    def to_cpu(self, x):
+        if self.on_gpu:
+            return cp.asnumpy(x)
+        return np.asarray(x)
+
+    def cpu_copy(self):
+        model_cpu = copy.copy(self)
+        model_cpu.on_gpu = False
+        model_cpu._NeuralNetwork__WB = [
+            (W.copy(), b.copy()) for W, b in self.to_cpu_WB()
+        ]
+        model_cpu._NeuralNetwork__init_random_range = None
+        model_cpu._NeuralNetwork__cache = []
+        return model_cpu
+
+    def move_to(self, device):
+        match device:
+            case self.Device.CPU:
+                wb_cpu = self.to_cpu_WB()
+                self._NeuralNetwork__WB = wb_cpu
+                self.on_gpu = False
+            case self.Device.GPU:
+                if cp is None:
+                    raise RuntimeError("CuPy is not installed")
+                self._NeuralNetwork__WB = [
+                    (cp.asarray(W), cp.asarray(b)) for W, b in self.to_cpu_WB()
+                ]
+                self.on_gpu = True
+            case _:
+                raise ValueError("Unsupported device")
+
+    @property
+    def xp(self):
+        return cp if self.on_gpu else np
+
+    @property
+    def L(self):
+        return self.__L
+
+    @property
+    def cache(self):
+        return self.__cache
+
+    @property
+    def WB(self):
+        return self.__WB
+
+    @property
+    def input_width(self):
+        return self.__input_width
+
+    @property
+    def layers(self):
+        return self.__layers
+
+    @property
+    def output_activation_type(self):
+        return self.__output_activation_type
+
+    @property
+    def hidden_activation_type(self):
+        return self.__hidden_activation_type
+
+    @classmethod
+    def init_layers(
+        cls,
+        X,
+        number_of_hidden_layers,
+        output_width=None,
+        start_width=None,
+        hidden_width=None,
+        parameter_budget=None,
+        layer_strategy=None,
+        start_width_heurist=None,
+        start_width_heuristic_cap=512,
+        output_aware_multiplier=4,
+        expansion_multiplier=2,
+    ):
+        if layer_strategy is None:
+            layer_strategy = cls.LayerStrategies.GEOMETRIC_TAPER
+        if start_width_heurist is None:
+            start_width_heurist = cls.StartWidthHeuristics.OUTPUT_AWARE
+
+        if not isinstance(X, np.ndarray):
+            raise TypeError("X must be a numpy.ndarray")
+        if X.ndim != 2:
+            raise ValueError("X must be a 2D feature-first matrix")
+        if not isinstance(number_of_hidden_layers, int):
+            raise TypeError("number_of_hidden_layers must be an integer")
+        if number_of_hidden_layers < 0:
+            raise ValueError("number_of_hidden_layers must be >= 0")
+        if output_width is None or not isinstance(output_width, int):
+            raise TypeError("output_dim must be an integer")
+        if output_width < 1:
+            raise ValueError("output_dim must be a positive integer")
+
+        input_width = X.shape[1]
+
+        if start_width is None:
+            match start_width_heurist:
+                case cls.StartWidthHeuristics.INPUT_WIDTH:
+                    start_width = input_width
+                case cls.StartWidthHeuristics.CAPPED_INPUT_WIDTH:
+                    start_width = min(start_width_heuristic_cap, input_width)
+                case cls.StartWidthHeuristics.OUTPUT_AWARE:
+                    start_width = max(
+                        output_width * 4, min(start_width_heuristic_cap, input_width)
+                    )
+                case _:
+                    raise ValueError(
+                        f"Unknown Start Width Heuristic, supported values are : {cls.StartWidthHeuristics.INPUT_WIDTH}, {cls.StartWidthHeuristics.CAPPED_INPUT_WIDTH}, {cls.StartWidthHeuristics.OUTPUT_AWARE}"
+                    )
+        elif not isinstance(start_width, int):
+            raise TypeError("start_width must be an integer")
+        elif start_width < 1:
+            raise ValueError("start_width must be a positive integer")
+
+        if number_of_hidden_layers == 0:
+            return [output_width]
+
+        if layer_strategy == cls.LayerStrategies.LINEAR_TAPER_FUNNEL:
+            if hidden_width is None:
+                hidden_width = max(output_width * 2, start_width // 2)
+            elif not isinstance(hidden_width, int):
+                raise TypeError("hidden_width must be an integer")
+            elif hidden_width < 1:
+                raise ValueError("hidden_width must be a positive integer")
+
+        if layer_strategy == cls.LayerStrategies.PARAMETER_BUDGET:
+            if parameter_budget is None:
+                raise TypeError(
+                    "parameter_budget must be provided for PARAMETER_BUDGET"
+                )
+            if not isinstance(parameter_budget, int):
+                raise TypeError("parameter_budget must be an integer")
+            if parameter_budget < 1:
+                raise ValueError("parameter_budget must be a positive integer")
+
+        match layer_strategy:
+            case cls.LayerStrategies.CONSTANT_WIDTH:
+                hidden = [start_width] * number_of_hidden_layers
+
+            case cls.LayerStrategies.LINEAR_TAPER_FUNNEL:
+                hidden = [
+                    max(
+                        1,
+                        int(
+                            round(
+                                start_width
+                                + (l / (number_of_hidden_layers + 1))
+                                * (hidden_width - start_width)
+                            )
+                        ),
+                    )
+                    for l in range(1, number_of_hidden_layers + 1)
+                ]
+
+            case cls.LayerStrategies.LINEAR_TAPER_FUNNEL_OUTPUT:
+                hidden = [
+                    max(
+                        1,
+                        int(
+                            round(
+                                start_width
+                                + (l / (number_of_hidden_layers + 1))
+                                * (output_width - start_width)
+                            )
+                        ),
+                    )
+                    for l in range(1, number_of_hidden_layers + 1)
+                ]
+
+            case cls.LayerStrategies.GEOMETRIC_TAPER:
+                ratio = (output_width / start_width) ** (
+                    1 / (number_of_hidden_layers + 1)
+                )
+                hidden = [
+                    max(1, int(round(start_width * (ratio**l))))
+                    for l in range(1, number_of_hidden_layers + 1)
+                ]
+
+            case cls.LayerStrategies.EXPANSION_COMPRESSION:
+                peak_width = max(start_width, input_width * expansion_multiplier)
+                if number_of_hidden_layers == 1:
+                    layers = [peak_width]
+                else:
+                    down_ratio = (output_width / peak_width) ** (
+                        1 / number_of_hidden_layers
+                    )
+                    layers = [
+                        max(1, int(round(peak_width * (down_ratio**l))))
+                        for l in range(number_of_hidden_layers)
+                    ]
+                layers.append(output_width)
+                return layers
+
+            case cls.LayerStrategies.BOTTLENECK_HOURGLASS:
+                bottleneck = max(1, min(output_width * 2, start_width // 4))
+                if number_of_hidden_layers == 1:
+                    layers = [bottleneck]
+                else:
+                    left_count = number_of_hidden_layers // 2
+                    right_count = number_of_hidden_layers - left_count
+
+                    left = []
+                    if left_count > 0:
+                        left_ratio = (bottleneck / start_width) ** (1 / left_count)
+                        left = [
+                            max(1, int(round(start_width * (left_ratio**l))))
+                            for l in range(1, left_count + 1)
+                        ]
+
+                    right = []
+                    if right_count > 0:
+                        right_start = left[-1] if left else bottleneck
+                        right_ratio = (start_width / right_start) ** (1 / right_count)
+                        right = [
+                            max(1, int(round(right_start * (right_ratio**l))))
+                            for l in range(1, right_count + 1)
+                        ]
+
+                    layers = (left + right)[:number_of_hidden_layers]
+
+                layers.append(output_width)
+                return layers
+
+            case cls.LayerStrategies.POWER_OF_TWO:
+                first_power = max(1, 2 ** int(np.floor(np.log2(start_width))))
+                layers = [
+                    max(1, first_power // (2**l))
+                    for l in range(number_of_hidden_layers)
+                ]
+                layers.append(output_width)
+                return layers
+
+            case cls.LayerStrategies.REVERSE_POWER_OF_TWO:
+                base_power = max(1, 2 ** int(np.floor(np.log2(start_width))))
+                layers = [
+                    max(1, base_power * (2**l)) for l in range(number_of_hidden_layers)
+                ]
+                layers.append(output_width)
+                return layers
+
+            case cls.LayerStrategies.PARAMETER_BUDGET:
+                if parameter_budget < output_width:
+                    raise ValueError("parameter_budget must be >= output_dim")
+
+                if number_of_hidden_layers == 1:
+                    width = max(
+                        1,
+                        int(
+                            (parameter_budget - output_width)
+                            / (input_width + output_width + 1)
+                        ),
+                    )
+                else:
+                    a = number_of_hidden_layers - 1
+                    b = input_width + output_width + number_of_hidden_layers
+                    c = output_width - parameter_budget
+                    disc = max(0.0, b * b - 4 * a * c)
+
+                    if a == 0:
+                        width = max(1, int(-c / max(1, b)))
+                    else:
+                        width = max(1, int((-b + np.sqrt(disc)) / (2 * a)))
+
+                layers = [width] * number_of_hidden_layers
+                layers.append(output_width)
+                return layers
+
+            case _:
+                raise ValueError(
+                    f"Unknown Layer Strategy, supported values are: {cls.LayerStrategies.CONSTANT_WIDTH}, {cls.LayerStrategies.LINEAR_TAPER_FUNNEL}, {cls.LayerStrategies.LINEAR_TAPER_FUNNEL_OUTPUT}, {cls.LayerStrategies.GEOMETRIC_TAPER}, {cls.LayerStrategies.EXPANSION_COMPRESSION}, {cls.LayerStrategies.BOTTLENECK_HOURGLASS}, {cls.LayerStrategies.POWER_OF_TWO}, {cls.LayerStrategies.REVERSE_POWER_OF_TWO}, {cls.LayerStrategies.PARAMETER_BUDGET}"
+                )
+
+        return hidden + [output_width]
+
+    @classmethod
+    def init_weights(cls, fan_out, fan_in, weight_init_strategy, rng=None, alpha=0.0):
+        if rng is None:
+            rng = np.random.default_rng()
+
+        if fan_in < 1 or fan_out < 1:
+            raise ValueError("fan_in and fan_out must be positive integers")
+
+        match weight_init_strategy:
+            case cls.WeightInitStrategy.XAVIER_NORMAL:
+                std = np.sqrt(2.0 / (fan_in + fan_out))
+                return rng.standard_normal((fan_out, fan_in)) * std
+
+            case cls.WeightInitStrategy.XAVIER_UNIFORM:
+                limit = np.sqrt(6.0 / (fan_in + fan_out))
+                return rng.uniform(-limit, limit, size=(fan_out, fan_in))
+
+            case cls.WeightInitStrategy.HE_NORMAL:
+                std = np.sqrt(2.0 / ((1.0 + alpha**2) * fan_in))
+                return rng.standard_normal((fan_out, fan_in)) * std
+
+            case cls.WeightInitStrategy.HE_UNIFORM:
+                limit = np.sqrt(6.0 / ((1.0 + alpha**2) * fan_in))
+                return rng.uniform(-limit, limit, size=(fan_out, fan_in))
+
+            case cls.WeightInitStrategy.LECUN_NORMAL:
+                std = np.sqrt(1.0 / fan_in)
+                return rng.standard_normal((fan_out, fan_in)) * std
+
+            case cls.WeightInitStrategy.LECUN_UNIFORM:
+                limit = np.sqrt(3.0 / fan_in)
+                return rng.uniform(-limit, limit, size=(fan_out, fan_in))
+
+            case cls.WeightInitStrategy.ZERO:
+                return np.zeros((fan_out, fan_in))
+
+            case _:
+                raise ValueError(
+                    f"Unknown Weight Init Strategy, supported values are : {list(NeuralNetwork.WeightInitStrategy)}"
+                )
+
+    @staticmethod
+    def logit(p, epsilon=1e-12):
+        p = float(np.clip(p, epsilon, 1.0 - epsilon))
+        return np.log(p / (1.0 - p))
+
+    @classmethod
+    def init_biases(
+        cls,
+        fan_out,
+        bias_init_strategy,
+        rng=None,
+        value=0.01,
+        std=1e-3,
+        is_output_layer=False,
+        hidden_activation_type=None,
+        output_activation_type=None,
+        hidden_bias_value=0.0,
+        output_positive_prior=None,
+        epsilon=1e-12,
+    ):
+        if fan_out < 1:
+            raise ValueError("fan_out must be a positive integer")
+
+        if rng is None:
+            rng = np.random.default_rng()
+
+        if is_output_layer and output_positive_prior is not None:
+            if output_activation_type != cls.OutputActivationType.SIGMOID:
+                raise ValueError(
+                    "output_positive_prior is only supported for SIGMOID output layers"
+                )
+            if fan_out != 1:
+                raise ValueError("output_positive_prior requires fan_out == 1")
+
+            b0 = cls.logit(output_positive_prior, epsilon)
+            return np.full((fan_out, 1), b0, dtype=float)
+
+        if (
+            not is_output_layer
+            and hidden_activation_type == cls.HiddenActivationType.RELU
+            and hidden_bias_value != 0.0
+        ):
+            return np.full((fan_out, 1), hidden_bias_value, dtype=float)
+
+        match bias_init_strategy:
+            case cls.BiasInitStrategy.ZERO:
+                return np.zeros((fan_out, 1))
+
+            case cls.BiasInitStrategy.CONSTANT:
+                return np.full((fan_out, 1), value)
+
+            case cls.BiasInitStrategy.NORMAL:
+                return rng.standard_normal((fan_out, 1)) * std
+
+            case cls.BiasInitStrategy.UNIFORM:
+                return rng.uniform(-value, value, size=(fan_out, 1))
+
+            case _:
+                raise ValueError("Unknown Bias Init Strategy")
+
+    def linear_model(self, W, X, b):
+        return X @ W.T + b.T
+
+    def sigmoid(self, z):
+        xp = self.xp
+        z = xp.asarray(z, dtype=xp.float32)
+        out = xp.empty_like(z)
+
+        pos = z >= 0
+        neg = ~pos
+
+        out[pos] = 1.0 / (1.0 + xp.exp(-z[pos]))
+        ez = xp.exp(z[neg])
+        out[neg] = ez / (1.0 + ez)
+
+        return out
+
+    def relu(self, z):
+        xp = self.xp
+        return xp.maximum(xp.float32(0.0), z)
+
+    def tanh(self, z):
+        xp = self.xp
+        return xp.tanh(z)
+
+    def leaky_relu(self, z, alpha=0.01):
+        xp = self.xp
+        return xp.where(z > 0, z, alpha * z)
+
+    def drelu_from_output(self, a):
+        xp = self.xp
+        return (a > 0).astype(xp.float32)
+
+    def dsigmoid_from_output(self, a):
+        xp = self.xp
+        return a * (1 - a)
+
+    def dtanh_from_output(self, a):
+        xp = self.xp
+        return 1.0 - a**2
+
+    def dleaky_relu_from_output(self, a, alpha=0.01):
+        xp = self.xp
+        return xp.where(a > 0, 1.0, alpha)
+
+    def softmax(self, Z):
+        xp = self.xp
+        Z = xp.asarray(Z, dtype=xp.float32)
+        Z_shifted = Z - xp.max(Z, axis=1, keepdims=True)
+        exp_Z = xp.exp(Z_shifted)
+        return exp_Z / xp.sum(exp_Z, axis=1, keepdims=True)
+
+    def mse_loss(self, Y, A):
+        xp = self.xp
+        m = Y.shape[0]
+        return xp.sum((A - Y) ** 2) / m
+
+    def multi_class_cross_entropy_loss(self, Y, A, epsilon=1e-12):
+        xp = self.xp
+        m = Y.shape[0]
+        A = xp.clip(A, epsilon, 1.0)
+        return -xp.sum(Y * xp.log(A)) / m
+
+    def binary_cross_entropy_loss(self, Y, A, epsilon=1e-12):
+        xp = self.xp
+        m = Y.shape[0]
+        A = xp.clip(A, epsilon, 1.0 - epsilon)
+        return -xp.sum(Y * xp.log(A) + (1 - Y) * xp.log(1 - A)) / m
+
+    def default_hidden_weight_init_strategy(self, hidden_activation_type):
+        match hidden_activation_type:
+            case self.HiddenActivationType.RELU | self.HiddenActivationType.LEAKY_RELU:
+                return self.WeightInitStrategy.HE_NORMAL
+            case self.HiddenActivationType.SIGMOID | self.HiddenActivationType.TANH:
+                return self.WeightInitStrategy.XAVIER_NORMAL
+            case _:
+                raise ValueError(
+                    f"Unknown Hidden Activation Type, supported values are : {self.HiddenActivationType.SIGMOID}, {self.HiddenActivationType.RELU}, {self.HiddenActivationType.LEAKY_RELU}, {self.HiddenActivationType.TANH}"
+                )
+
+    def default_output_weight_init_strategy(self, output_activation_type):
+        match output_activation_type:
+            case self.OutputActivationType.SIGMOID | self.OutputActivationType.SOFTMAX:
+                return self.WeightInitStrategy.XAVIER_NORMAL
+            case _:
+                raise ValueError(
+                    f"Unknown Output Activation Type, supported values are : {self.OutputActivationType.SIGMOID}, {self.OutputActivationType.SOFTMAX}"
+                )
+
+    def hidden_derivative_from_output(self, a):
+        hidden_activation_type = self.__hidden_activation_type
+        match hidden_activation_type:
+            case self.HiddenActivationType.SIGMOID:
+                return self.dsigmoid_from_output(a)
+            case self.HiddenActivationType.RELU:
+                return self.drelu_from_output(a)
+            case self.HiddenActivationType.LEAKY_RELU:
+                return self.dleaky_relu_from_output(a)
+            case self.HiddenActivationType.TANH:
+                return self.dtanh_from_output(a)
+            case _:
+                raise ValueError(
+                    f"Unknown Hidden Activation Type, supported values are : {self.HiddenActivationType.SIGMOID}, {self.HiddenActivationType.RELU}, {self.HiddenActivationType.LEAKY_RELU}, {self.HiddenActivationType.TANH}"
+                )
+
+    def activation(self, A):
+        hidden_activation_type = self.__hidden_activation_type
+        match hidden_activation_type:
+            case self.HiddenActivationType.SIGMOID:
+                return self.sigmoid(A)
+            case self.HiddenActivationType.RELU:
+                return self.relu(A)
+            case self.HiddenActivationType.LEAKY_RELU:
+                return self.leaky_relu(A)
+            case self.HiddenActivationType.TANH:
+                return self.tanh(A)
+            case _:
+                raise ValueError(
+                    f"Unknown Hidden Activation Type, supported values are : {self.HiddenActivationType.SIGMOID}, {self.HiddenActivationType.RELU}, {self.HiddenActivationType.LEAKY_RELU}, {self.HiddenActivationType.TANH}"
+                )
+
+    def loss(self, Y, A, epsilon=None):
+        if epsilon is None:
+            epsilon = self.TrainDefaults().epsilon
+
+        loss_type = self.__loss_type
+        if loss_type == self.LossType.MSE:
+            return self.mse_loss(Y, A)
+        if loss_type == self.LossType.MULTI_CLASS_CROSS_ENTROPY:
+            return self.multi_class_cross_entropy_loss(Y, A, epsilon)
+        if loss_type == self.LossType.BINARY_CROSS_ENTROPY:
+            return self.binary_cross_entropy_loss(Y, A, epsilon)
+
+        is_binary = (
+            self.__output_activation_type == self.OutputActivationType.SIGMOID
+            and A.shape[1] == 1
+        )
+
+        if is_binary:
+            return self.binary_cross_entropy_loss(Y, A, epsilon)
+
+        return self.multi_class_cross_entropy_loss(Y, A, epsilon)
+
+    def output_delta(self, y_hat, y):
+        return y_hat - y
+
+    def bernoulli(self, shape, p):
+        xp = self.xp
+        keep_prob = 1.0 - p
+        return (xp.random.random(shape) < keep_prob).astype(xp.float32)
+
+    def sum_weight_squares(self, WB):
+        xp = self.xp
+        return sum(xp.sum(W * W) for W, _ in WB)
+
+    def forward_pass(self, X, cfg=None, training_mode=False):
+        output_activation_type = self.__output_activation_type
+        hidden_activation_type = self.__hidden_activation_type
+
+        drop_out_rate = 0.0
+        keep_prob = 0.0
+
+        if training_mode:
+            if cfg is None:
+                cfg = self.TrainDefaults()
+
+            drop_out_rate = cfg.drop_out_rate
+            if not (0.0 <= drop_out_rate < 1.0):
+                raise ValueError("drop_out_rate must be in [0.0, 1.0)")
+
+            keep_prob = 1.0 - drop_out_rate
+
+        self.__cache = [X]
+        activation_cache = []
+        M = []
+
+        for i in range(self.__L):
+            W, b = self.__WB[i]
+            A_prev = self.__cache[i]
+            Z = self.linear_model(W, A_prev, b)
+
+            if i == self.__L - 1:
+                if output_activation_type == self.OutputActivationType.SIGMOID:
+                    A_raw = self.sigmoid(Z)
+                elif output_activation_type == self.OutputActivationType.SOFTMAX:
+                    A_raw = self.softmax(Z)
+                else:
+                    raise ValueError(
+                        "output_activation_type must be SIGMOID or SOFTMAX"
+                    )
+                A = A_raw
+                M.append(None)
+            else:
+                A_raw = self.activation(Z)
+                if training_mode and drop_out_rate > 0.0:
+                    mask = self.bernoulli(A_raw.shape, drop_out_rate)
+                    A = (A_raw * mask) / keep_prob
+                    M.append(mask)
+                else:
+                    A = A_raw
+                    M.append(None)
+
+            activation_cache.append(A_raw)
+            self.__cache.append(A)
+
+        return A, self.__cache, activation_cache, M
+
+    def backward_propagation(
+        self, Y, cache, activation_cache, M, cfg=None, training_mode=False
+    ):
+        hidden_activation_type = self.hidden_activation_type
+
+        xp = self.xp
+        drop_out_rate = 0.0
+        keep_prob = 0.0
+
+        if training_mode and cfg is None:
+            cfg = self.TrainDefaults()
+
+        if training_mode and cfg is not None:
+            drop_out_rate = cfg.drop_out_rate
+            if not (0.0 <= drop_out_rate < 1.0):
+                raise ValueError("drop_out_rate must be in [0.0, 1.0)")
+            keep_prob = 1.0 - drop_out_rate
+
+        m = Y.shape[0]
+        grads = [None] * self.__L
+
+        dZ = self.output_delta(cache[-1], Y)
+
+        for l in range(self.__L - 1, -1, -1):
+            A_prev = cache[l]
+
+            dW = (dZ.T @ A_prev) / m
+            db = xp.sum(dZ, axis=0, keepdims=True).T / m
+            grads[l] = (dW, db)
+
+            if l > 0:
+                W_l, _ = self.__WB[l]
+                A_l = cache[l]
+                dA_prev = dZ @ W_l
+
+                if training_mode and drop_out_rate > 0.0 and M[l - 1] is not None:
+                    dA_prev = (dA_prev * M[l - 1]) / keep_prob
+
+                A_prev = activation_cache[l - 1]
+                dZ = dA_prev * self.hidden_derivative_from_output(A_prev)
+
+        return grads
+
+    def momentum(self, grads, layer, cfg=None):
+        if cfg is None:
+            cfg = self.TrainDefaults()
+
+        momentum_coefficient = cfg.momentum_coefficient
+
+        dW, db = grads
+        self.velocity_dW[layer] = (
+            momentum_coefficient * self.velocity_dW[layer]
+            + (1 - momentum_coefficient) * dW
+        )
+        self.velocity_db[layer] = (
+            momentum_coefficient * self.velocity_db[layer]
+            + (1 - momentum_coefficient) * db
+        )
+
+    def rms_prop(self, grads, layer, cfg=None):
+        if cfg is None:
+            cfg = self.TrainDefaults()
+        rms_coefficient = cfg.rms_coefficient
+
+        dW, db = grads
+        self.rms_dW[layer] = rms_coefficient * self.rms_dW[layer] + (
+            1 - rms_coefficient
+        ) * (dW * dW)
+        self.rms_db[layer] = rms_coefficient * self.rms_db[layer] + (
+            1 - rms_coefficient
+        ) * (db * db)
+
+    def adam(self, grads, layer, cfg=None):
+        if cfg is None:
+            cfg = self.TrainDefaults()
+        momentum_coefficient = cfg.momentum_coefficient
+        rms_coefficient = cfg.rms_coefficient
+
+        dW, db = grads
+
+        self.momentum((dW, db), layer, cfg)
+        self.rms_prop((dW, db), layer, cfg)
+
+        velocity_dW = self.velocity_dW[layer] / (1 - momentum_coefficient**self.t)
+        velocity_db = self.velocity_db[layer] / (1 - momentum_coefficient**self.t)
+        rms_dW = self.rms_dW[layer] / (1 - rms_coefficient**self.t)
+        rms_db = self.rms_db[layer] / (1 - rms_coefficient**self.t)
+
+        return velocity_dW, velocity_db, rms_dW, rms_db
+
+    def init_momentum_state(self):
+        xp = self.xp
+        self.velocity_dW = []
+        self.velocity_db = []
+        for W, b in self.__WB:
+            self.velocity_dW.append(xp.zeros_like(W))
+            self.velocity_db.append(xp.zeros_like(b))
+
+    def init_rms_state(self):
+        xp = self.xp
+        self.rms_dW = []
+        self.rms_db = []
+        for W, b in self.__WB:
+            self.rms_dW.append(xp.zeros_like(W))
+            self.rms_db.append(xp.zeros_like(b))
+
+    def init_adam_state(self):
+        self.t = 0
+
+    def optimizer(self, grads, learning_rate, optimizer_type=None, cfg=None):
+        xp = self.xp
+        if cfg is None:
+            cfg = self.TrainDefaults()
+        if optimizer_type is None:
+            optimizer_type = self.Optimizers.GDC
+
+        for l in range(self.__L):
+            W, b = self.__WB[l]
+            match optimizer_type:
+                case self.Optimizers.GDC:
+                    dW, db = grads[l]
+                    self.update_parameters(W, b, dW, db, learning_rate, l)
+                case self.Optimizers.MOMENTUM:
+                    if not hasattr(self, "velocity_dW") or not hasattr(
+                        self, "velocity_db"
+                    ):
+                        self.init_momentum_state()
+                    self.momentum(grads[l], l, cfg)
+                    self.update_parameters(
+                        W, b, self.velocity_dW[l], self.velocity_db[l], learning_rate, l
+                    )
+                case self.Optimizers.RMS_PROP:
+                    if not hasattr(self, "rms_dW") or not hasattr(self, "rms_db"):
+                        self.init_rms_state()
+                    dW, db = grads[l]
+                    self.rms_prop((dW, db), l, cfg)
+                    epsilon = cfg.epsilon
+                    self.update_parameters(
+                        W,
+                        b,
+                        dW / (xp.sqrt(self.rms_dW[l]) + epsilon),
+                        db / (xp.sqrt(self.rms_db[l]) + epsilon),
+                        learning_rate,
+                        l,
+                    )
+                case self.Optimizers.ADAM:
+                    if not hasattr(self, "velocity_dW") or not hasattr(
+                        self, "velocity_db"
+                    ):
+                        self.init_momentum_state()
+                    if not hasattr(self, "rms_dW") or not hasattr(self, "rms_db"):
+                        self.init_rms_state()
+                    dW, db = grads[l]
+                    velocity_dW, velocity_db, rms_dW, rms_db = self.adam(
+                        (dW, db), l, cfg
+                    )
+                    epsilon = cfg.epsilon
+                    self.update_parameters(
+                        W,
+                        b,
+                        velocity_dW / (xp.sqrt(rms_dW) + epsilon),
+                        velocity_db / (xp.sqrt(rms_db) + epsilon),
+                        learning_rate,
+                        l,
+                    )
+                case _:
+                    raise ValueError(
+                        f"Invalid Optimizer, supported values are : {self.Optimizers.MOMENTUM.name}, {self.Optimizers.RMS_PROP}, {self.Optimizers.ADAM}"
+                    )
+
+    def update_parameters(self, W, b, dW, db, learning_rate, layer):
+        self.__WB[layer] = (W - learning_rate * dW, b - learning_rate * db)
+
+    def step_decay(self, initial_lr, decay_factor, epoch, step):
+        return initial_lr * (decay_factor ** (epoch // step))
+
+    def inverse_decay(self, initial_lr, decay_factor, epoch):
+        return initial_lr / (1 + decay_factor * epoch)
+
+    def exponential_decay(self, initial_lr, decay_factor, epoch):
+        return initial_lr * (decay_factor**epoch)
+
+    def learning_decay(
+        self,
+        initial_lr,
+        decay_factor,
+        epoch,
+        step,
+        learning_decay_type=LearningDecayType.STEP_DECAY,
+    ):
+        match learning_decay_type:
+            case self.LearningDecayType.STEP_DECAY:
+                return self.step_decay(initial_lr, decay_factor, epoch, step)
+            case self.LearningDecayType.INVERSE_DECAY:
+                return self.inverse_decay(initial_lr, decay_factor, epoch)
+            case self.LearningDecayType.EXPONENTIAL_DECAY:
+                return self.exponential_decay(initial_lr, decay_factor, epoch)
+            case _:
+                raise ValueError(
+                    f"Unknown Learning Decay Type, supported values are : {self.LearningDecayType.STEP_DECAY}"
+                )
+
+    def count_parameters(self):
+        number_of_parameters = 0
+        for W, b in self.__WB:
+            number_of_parameters = W.size + b.size
+        return number_of_parameters
+
+    def parameters_breakdown(self):
+        breakdown = []
+        for i, (W, b) in enumerate(self.__WB, start=1):
+            total_parameters = W.size + b.size
+            breakdown.append(
+                {
+                    "layer": i,
+                    "weight_shape": W.shape,
+                    "bias_shape": b.shape,
+                    "weight_parameters": W.size,
+                    "bias_parameters": b.size,
+                    "total_parameters": total_parameters,
+                }
+            )
+        return breakdown
+
+    def summary(self):
+        print("\nNeural Network Summary\n")
+        print(f"Number of layers: {self.__L}")
+        print(f"Hidden Activation : {self.__hidden_activation_type.name}")
+        print(f"Output Activation : {self.__output_activation_type.name}")
+        print(f"Loss Type : {self.__loss_type.name}")
+        print(f"Total Number of Parameters : {self.count_parameters()}")
+        print()
+        breakdown = self.parameters_breakdown()
+        print(breakdown)
+
+    def train(
+        self,
+        X_train,
+        Y_train,
+        X_valid,
+        Y_valid,
+        X_test,
+        Y_test,
+        _log=False,
+        graph=False,
+        synch=False,
+        real_time_tracking=False,
+        finalize=False,
+        _log_predictions=False,
+        early_stopping=False,
+        restore_best=False,
+        dropout=False,
+        l2=False,
+        error_analysis=False,
+        _log_error_analysis=False,
+        _log_confusion_matrix=False,
+        error_analysis_file=None,
+        error_analysis_path=None,
+        cfg=None,
+        learning_decay_type=None,
+        data_augmentation_type=None,
+        optimizer_type=None,
+    ):
+        xp = self.xp
+        if X_train.ndim != 2:
+            raise ValueError("X must be 2D: (samples, features)")
+        if Y_train.ndim != 2:
+            raise ValueError("Y must be 2D: (samples, outputs)")
+        if X_train.shape[0] != Y_train.shape[0]:
+            raise ValueError("X and Y must have the same number of samples")
+        if X_train.shape[1] != self.__WB[0][0].shape[1]:
+            raise ValueError("X feature count does not match model input size")
+
+        if cfg is None:
+            cfg = self.TrainDefaults()
+
+        learning_rate = cfg.learning_rate
+        epochs = cfg.epochs
+        step = cfg.step
+        epsilon = cfg.epsilon
+        l2_lambda = cfg.l2_lambda
+        drop_out_rate = cfg.drop_out_rate
+        patience = cfg.patience
+        decay_factor = cfg.decay_factor
+        batch_size = cfg.batch_size
+        seed = cfg.seed
+        validation_tolerance = cfg.validation_tolerance
+
+        if _log:
+            space = " "
+            loading_bar_length = 10
+            padding = 10
+            loading = "▱"
+            loaded = "▰"
+            print()
+        if _log_predictions:
+            tr = self.Paths
+            train_prediction_file = tr.train_prediction_file
+            validation_prediction_file = tr.validation_prediction_file
+            test_prediction_file = tr.test_prediction_file
+            prediction_path = tr.prediction_path
+            prediction_tolerance = cfg.prediction_tolerance
+            prediction_threshold = cfg.prediction_threshold
+            _encoding = self.Encodings().UTF_8
+
+        base_m = X_train.shape[0]
+
+        best_val_loss = float("inf")
+        best_WB = copy.deepcopy(self.__WB)
+        patience_counter = 0
+
+        current_lr = learning_rate
+        initial_lr = learning_rate
+
+        train_losses = []
+        val_losses = []
+        val_accuracies = []
+        best_epoch = None
+        steps = []
+
+        if self.on_gpu:
+            xp.random.seed(seed)
+            random_range = None
+        else:
+            random_range = np.random.default_rng(seed)
+
+        if type(epochs) is not int:
+            raise TypeError("iterations must be an integer")
+        if epochs < 1:
+            raise ValueError("iterations must be a positive integer")
+        if not isinstance(learning_rate, (float, np.floating)):
+            raise TypeError("learning_rate must be a float")
+        learning_rate = float(learning_rate)
+        if learning_rate < 0:
+            raise ValueError("learning_rate must be positive")
+        if not (0.0 <= drop_out_rate < 1.0):
+            raise ValueError("drop_out_rate must be in [0.0, 1.0)")
+        if _log or graph:
+            if type(step) is not int:
+                raise TypeError("step must be an integer")
+            if step < 1 or step > epochs:
+                raise ValueError("step must be positive and <= iterations")
+        start_time = time.perf_counter()
+        epoch_times = []
+
+        for epoch in range(epochs):
+            if learning_decay_type is not None:
+                current_lr = self.learning_decay(
+                    initial_lr, decay_factor, epoch, step, learning_decay_type
+                )
+            epoch_start = time.perf_counter()
+            
+            train_data_loss = 0.0
+            train_reg_loss = 0.0
+            train_total_loss = train_data_loss + train_reg_loss
+
+            X_shuffle, Y_shuffle = self.shuffle_dataset(
+                X_train, Y_train, base_m, random_range
+            )
+
+            if data_augmentation_type is not None:
+                X_epoch, Y_epoch = self.data_augmentation(
+                    X_shuffle, Y_shuffle, data_augmentation_type, random_range
+                )
+            else:
+                X_epoch, Y_epoch = X_shuffle, Y_shuffle
+
+            epoch_m = X_epoch.shape[0]
+
+            if optimizer_type is self.Optimizers.ADAM and not hasattr(self, "t"):
+                self.init_adam_state()
+
+            for batch_start in range(0, epoch_m, batch_size):
+
+                if optimizer_type is self.Optimizers.ADAM and hasattr(self, "t"):
+                    self.t += 1
+
+                end = min(batch_start + batch_size, epoch_m)
+
+                X_batch = X_epoch[batch_start:end, :]
+                Y_batch = Y_epoch[batch_start:end, :]
+
+                batch_m = Y_batch.shape[0]
+
+                if dropout:
+                    A, cache, activation_cache, M = self.forward_pass(
+                        X_batch, cfg=cfg, training_mode=True
+                    )
+                    grads = self.backward_propagation(
+                        Y_batch, cache, activation_cache, M, cfg=cfg, training_mode=True
+                    )
+                else:
+                    A, cache, activation_cache, M = self.forward_pass(
+                        X_batch, cfg=None, training_mode=False
+                    )
+                    grads = self.backward_propagation(
+                        Y_batch,
+                        cache,
+                        activation_cache,
+                        M,
+                        cfg=None,
+                        training_mode=False,
+                    )
+
+                if l2:
+                    grads_with_L2 = []
+                    for l in range(self.__L):
+                        W, b = self.__WB[l]
+                        dW, db = grads[l]
+                        # dW = dW + l2_lambda * W
+                        dW = dW + (l2_lambda / batch_m) * W
+                        grads_with_L2.append((dW, db))
+
+                    self.optimizer(grads_with_L2, current_lr, optimizer_type, cfg)
+                else:
+                    self.optimizer(grads, current_lr, optimizer_type, cfg)
+
+                batch_loss = self.loss(Y_batch, A, epsilon)
+                train_data_loss += batch_loss * (end - batch_start)
+
+            if self.on_gpu:
+                cp.cuda.Stream.null.synchronize()
+            epoch_elapsed = time.perf_counter() - epoch_start
+            total_elapsed = time.perf_counter() - start_time
+            epoch_times.append(epoch_elapsed)
+
+            train_data_loss = train_data_loss / epoch_m
+            # train_reg_loss = (l2_lambda / 2) * self.sum_weight_squares(self.__WB)
+
+            if l2:
+                train_reg_loss = (l2_lambda / (2 * epoch_m)) * self.sum_weight_squares(
+                    self.__WB
+                )
+            train_total_loss = train_data_loss + train_reg_loss
+            _, val_data_loss, val_acc = self.evaluate_dataset(X_valid, Y_valid)
+
+            if synch:
+                train_data_loss = self.scalar_to_python(train_data_loss)
+                train_reg_loss = self.scalar_to_python(train_reg_loss)
+                train_total_loss = self.scalar_to_python(train_total_loss)
+                val_data_loss = self.scalar_to_python(val_data_loss)
+                val_acc = self.scalar_to_python(val_acc)
+
+            if epoch >= 0 and epoch % step == 0:
+                if _log:
+                    avg_epoch_time = total_elapsed / (epoch + 1)
+                    remaining_epochs = epochs - epoch + 1
+                    eta = avg_epoch_time * remaining_epochs
+                    progression = epoch/epochs
+                    print(
+                        f"Fitting the network {loaded*int(progression*loading_bar_length)}{loading*(loading_bar_length - int(loading_bar_length * progression))} {int(progression*100)}% [ Epoch: {epoch} ] [ Elapsed: {total_elapsed:.0f}s ] [ ETA: {eta:.0f}s ] [ Train_data_loss: {train_data_loss:.4f} ] [ Train_reg_loss: {train_reg_loss:.4f} ] [ Train_total_loss: {train_total_loss:.4f} ] [ Val_data_loss: {val_data_loss:.4f} Best: {best_val_loss:.4f} Patience: {patience_counter}] [ Validation Accuracy: {val_acc:.2f} ]{space*padding}",
+                        end="\r"
+                    )
+
+                if synch and (graph or real_time_tracking):
+                    train_losses.append(train_data_loss)
+                    val_losses.append(val_data_loss)
+                    val_accuracies.append(val_acc)
+                    steps.append(epoch)
+                if synch and real_time_tracking:
+                    plt.ion()
+                    plt.title(self.TrainResults.figure_title)
+                    plt.plot(steps, train_losses, label="Train Loss")
+                    plt.plot(steps, val_losses, label="Validation Loss")
+                    plt.xlabel("iteration")
+                    plt.ylabel("loss")
+                    plt.pause(0.05)
+
+            if best_val_loss - val_data_loss > validation_tolerance:
+                best_val_loss = val_data_loss
+                best_WB = copy.deepcopy(self.__WB)
+                best_epoch = epoch
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            if early_stopping and patience_counter >= patience:
+                print()
+                print(f"[ Overfitting detected. Early stopping at epoch: {epoch} ]")
+                break
+
+        if restore_best and best_WB is not None:
+            self.__WB = best_WB
+
+        _, final_data_loss, final_accuracy = self.evaluate_dataset(X_train, Y_train)
+        final_reg_loss = (l2_lambda / (2 * X_train.shape[0])) * self.sum_weight_squares(
+            self.__WB
+        )
+        final_loss = final_data_loss + final_reg_loss
+
+        if finalize:
+            print("\n\nFinal Results : \n")
+            train_pred, train_loss, train_acc = self.evaluate_dataset(X_train, Y_train)
+            val_pred, val_loss, val_acc = self.evaluate_dataset(X_valid, Y_valid)
+
+            print("Train:", train_loss, train_acc)
+            print("Valid:", val_loss, val_acc)
+
+            if X_test is not None and Y_test is not None:
+                test_pred, test_loss, test_acc = self.evaluate_dataset(X_test, Y_test)
+                print("Test :", test_loss, test_acc)
+
+                if error_analysis:
+                    print("\nError analysis : ")
+                    true_labels = xp.argmax(Y_test, axis=1)
+                    prediction_labels = xp.argmax(test_pred, axis=1)
+                    for i in range(0, self.__number_of_classes):
+                        error_analysis_result = self.error_analysis(
+                            self.confusion_matrix(
+                                i,
+                                true_labels,
+                                prediction_labels,
+                                _log_confusion_matrix,
+                                error_analysis_file,
+                                error_analysis_path,
+                            ),
+                            _log_error_analysis,
+                            error_analysis_file,
+                            error_analysis_path,
+                        )
+                        print(error_analysis_result)
+
+        train_results = self.TrainResults(
+            losses=train_losses,
+            val_losses=val_losses,
+            best_val_loss=best_val_loss,
+            val_accuracies=val_accuracies,
+            best_epoch=best_epoch,
+            final_loss=final_loss,
+            accuracy=final_accuracy,
+            final_learning_rate=current_lr,
+        )
+
+        if _log_predictions:
+            total_samples = (
+                len(Y_train) + len(Y_valid) + (len(Y_test) if Y_test is not None else 0)
+            )
+            if total_samples > prediction_tolerance:
+                print(
+                    "\nThe current dataset is too large, >100 samples is expected to be written!"
+                )
+                print(
+                    "\nDo you really want to write down all those predictions? If not, input [N/No], otherwise [Y/Yes] (case-insensitive)"
+                )
+                while True:
+                    choice = (
+                        input("Do you wish to continue? [y(Y)/n(N)] ").strip().lower()
+                    )
+                    if choice in ("y", "yes"):
+                        break
+                    elif choice in ("n", "no"):
+                        _log_predictions = False
+                        break
+                    else:
+                        print("Invalid Input, supported values are : [N/n/No, Y/y/Yes]")
+
+            self.log_predictions(
+                Y_train,
+                train_pred,
+                _log_predictions,
+                train_prediction_file,
+                prediction_path,
+                prediction_tolerance,
+                prediction_threshold,
+                _encoding,
+            )
+            self.log_predictions(
+                Y_valid,
+                val_pred,
+                _log_predictions,
+                validation_prediction_file,
+                prediction_path,
+                prediction_tolerance,
+                prediction_threshold,
+                _encoding,
+            )
+            if Y_test is not None and test_pred is not None:
+                self.log_predictions(
+                    Y_test,
+                    test_pred,
+                    _log_predictions,
+                    test_prediction_file,
+                    prediction_path,
+                    prediction_tolerance,
+                    prediction_threshold,
+                    _encoding,
+                )
+
+        if synch and graph:
+            plt.ioff()
+            plt.title(self.TrainResults.figure_title)
+            plt.plot(steps, train_losses, label="Train Loss")
+            plt.plot(steps, val_losses, label="Validation Loss")
+            plt.xlabel("iteration")
+            plt.ylabel("loss")
+            plt.show()
+
+        return train_results
+
+    def log_predictions(
+        self,
+        Y,
+        predictions,
+        _log_predictions,
+        prediction_file,
+        prediction_path,
+        prediction_tolerance,
+        prediction_threshold,
+        _encoding,
+    ):
+        if prediction_path is not None and not os.path.exists(prediction_path):
+            os.mkdir(prediction_path)
+
+        if _log_predictions:
+            prediction_file_name = prediction_file + self.Extensions.text
+            prediction_file_path = prediction_path + prediction_file_name
+
+            if _encoding is None:
+                _encoding = self.Encodings().UTF_8
+
+            with open(prediction_file_path, "w", encoding=_encoding) as f:
+                for i in range(len(predictions)):
+                    sample = Y[i]
+                    prediction = predictions[i]
+                    sample_result = np.where(sample == 1)[0]
+                    prediction_result = np.where(prediction == 1)[0]
+                    f.write(
+                        f"Sample : {sample_result}, Prediction : {prediction_result} {"correct" if sample_result == prediction_result else "failed"}\n"
+                    )
+            print(
+                f"\nFirst <{prediction_threshold} predictions are written in {prediction_file_path}\n"
+            )
+        else:
+            first_sample, last_sample, first_prediction, last_prediction = (
+                Y[0],
+                Y[-1],
+                predictions[0],
+                predictions[-1],
+            )
+            print(
+                "Detailed Prediction Logging disabled, falling back to the first and last sample predictions : "
+            )
+            print(
+                f"First Sample : {np.where(first_sample == 1)[0]}, Prediction : {np.where(first_prediction == 1)[0]}"
+            )
+            print(
+                f"Last Sample : {np.where(last_sample == 1)[0]}, Prediction : {np.where(last_prediction == 1)[0]}\n"
+            )
+
+    def shuffle_dataset(self, X, Y, size, random_range):
+        xp = self.xp
+
+        if self.on_gpu:
+            permutation = xp.random.permutation(size)
+        else:
+            if random_range is None:
+                random_range = np.random.default_rng()
+            permutation = random_range.permutation(size)
+
+        X_shuf = X[permutation]
+        Y_shuf = Y[permutation]
+        return X_shuf, Y_shuf
+
+    def evaluate_dataset(self, X, Y, epsilon=None, threshold=None):
+        xp = self.xp
+
+        if epsilon is None:
+            epsilon = self.TrainDefaults().epsilon
+
+        A, _ = self.predict(X)
+        loss = self.loss(Y, A, epsilon)
+
+        is_binary = (
+            self.output_activation_type == self.OutputActivationType.SIGMOID
+            and A.shape[1] == 1
+        )
+
+        if is_binary:
+            if threshold is None:
+                threshold = self.__config.threshold
+            prediction = (A >= threshold).astype(xp.float32)
+            accuracy = xp.mean(prediction == Y) * 100.0
+        else:
+            predicted_classes = xp.argmax(A, axis=1)
+            true_classes = xp.argmax(Y, axis=1)
+            prediction = xp.zeros_like(A)
+            prediction[xp.arange(A.shape[0]), predicted_classes] = 1
+            accuracy = xp.mean(predicted_classes == true_classes) * 100.0
+
+        return prediction, loss, accuracy
+
+    def predict_classes(self, X, output_activation_type=None, xp=None, threshold=None):
+        if output_activation_type is None:
+            output_activation_type = self.__output_activation_type
+        if xp is None:
+            xp = self.xp
+
+        A = self.predict_proba(X)
+
+        is_binary = (
+            output_activation_type == self.OutputActivationType.SIGMOID
+            and A.shape[1] == 1
+        )
+
+        if threshold is None:
+            threshold = self.TrainDefaults().threshold
+        if is_binary:
+            prediction = (A >= threshold).astype(xp.float32)
+            return prediction, is_binary
+        else:
+            prediction = xp.zeros_like(A)
+            prediction[xp.arange(A.shape[0]), xp.argmax(A, axis=1)] = 1
+            return prediction, is_binary
+
+    def predict_proba(self, X):
+        A, _ = self.predict(X)
+        return A
+
+    def predict(self, x):
+        A, cache, _, _ = self.forward_pass(x, training_mode=False)
+        return A, cache
+
+    def error_analysis(
+        self,
+        confusion_matrix,
+        _log_error_analysis=False,
+        error_analysis_file=None,
+        error_analysis_path=None,
+    ):
+        TP = confusion_matrix[0]
+        TN = confusion_matrix[1]
+        FP = confusion_matrix[2]
+        FN = confusion_matrix[3]
+
+        total = sum(confusion_matrix)
+
+        accuracy = (TP + TN) / (total + self.__config.epsilon)
+        percision = TP / (TP + FP + self.__config.epsilon)
+        recall = TP / (TP + FN)
+        specifity = TN / (TP + FP + self.__config.epsilon)
+        # FP / (FP + TN)
+        false_positive_rate = 1 - specifity
+        # FN / (FN + TP)
+        false_negative_rate = 1 - recall
+        true_negative_rate = specifity
+        true_positive_rate = recall
+        balanced_accuracy = (recall + specifity) / 2
+        matthews_correlation_coefficient = ((TP * TN) - (FP * FN)) / (
+            np.sqrt((TP + FP) * (TP + FN) * (TN + FP) * (TN + FN)) + self.__config.epsilon
+        )
+        jaccart_index = TP / (TP + FP + FN + self.__config.epsilon)
+
+        tp = self.ErrorAnalysis().tp
+        fp = self.ErrorAnalysis().fp
+        tn = self.ErrorAnalysis().tn
+        fn = self.ErrorAnalysis().fn
+        f1 = self.ErrorAnalysis().f1
+        acc = self.ErrorAnalysis().acc
+        per = self.ErrorAnalysis().per
+        rec = self.ErrorAnalysis().rec
+        spec = self.ErrorAnalysis().spec
+        fpr = self.ErrorAnalysis().fpr
+        fnr = self.ErrorAnalysis().fnr
+        tnr = self.ErrorAnalysis().tnr
+        tpr = self.ErrorAnalysis().tpr
+        mcc = self.ErrorAnalysis().mcc
+        iou = self.ErrorAnalysis().iou
+        bal_acc = self.ErrorAnalysis().bal_acc
+
+        if _log_error_analysis:
+            _error_analysis_log = f"""{tp}: {TP}\n{fp}: {TN}\n{tn}: {FP}\n{fn}: {FN}\n{acc}: {(TP + TN) / (total + self.__config.epsilon)}\n{per}: {percision}\n{rec}: {recall}\n{f1}: {2 * (percision * recall) / (percision + recall + self.__config.epsilon)}, \n{spec}: {specifity}, \n{fpr}: {false_positive_rate}, \n{fnr}: {false_negative_rate}, \n{tnr}: {true_negative_rate}, \n{tpr}: {true_positive_rate}, \n{mcc}: {matthews_correlation_coefficient}, \n{iou}: {jaccart_index}, \n{bal_acc}: {balanced_accuracy}"""
+            print(f"\n{_error_analysis_log}\n")
+
+            if error_analysis_file is None:
+                error_analysis_file = self.Paths().error_analysis_file
+                error_analysis_path = self.Paths().error_analysis_path
+            if not os.path.exists(error_analysis_path):
+                os.mkdir(error_analysis_path)
+            error_analysis_full_path = (
+                error_analysis_path + error_analysis_file + self.Extensions().text
+            )
+            with open(error_analysis_full_path, "a") as f:
+                f.write(
+                    f"\n\nModel Train Error Analysis for date : {datetime.utcnow().isoformat() + "Z"}\n\n"
+                )
+                f.write(_error_analysis_log)
+            print(f"\nError Analysis Are written to : {error_analysis_full_path}\n")
+
+        return {
+            tp: TP,
+            fp: FP,
+            tn: TN,
+            fn: FN,
+            acc: accuracy,
+            per: percision,
+            rec: recall,
+            f1: 2 * (percision * recall) / (percision + recall + self.__config.epsilon),
+            spec: specifity,
+            fpr: false_positive_rate,
+            fnr: false_negative_rate,
+            tnr: true_negative_rate,
+            tpr: true_positive_rate,
+            mcc: matthews_correlation_coefficient,
+            iou: jaccart_index,
+            bal_acc: balanced_accuracy,
+        }
+
+    def confusion_matrix(
+        self,
+        OvR,
+        true_labels,
+        prediction_labels,
+        _log_confusion_matrix=False,
+        confusion_matrix_file=None,
+        confusion_matrix_path=None,
+    ):
+        if _log_confusion_matrix:
+            self.log_confusion_matrix(OvR, confusion_matrix_file, confusion_matrix_path)
+
+        num_TP = 0
+        num_TN = 0
+        num_FP = 0
+        num_FN = 0
+
+        for i in range(len(prediction_labels)):
+            if prediction_labels[i] == OvR and true_labels[i] == OvR:
+                num_TP += 1
+            elif prediction_labels[i] != OvR and true_labels[i] != OvR:
+                num_TN += 1
+            elif prediction_labels[i] == OvR and true_labels[i] != OvR:
+                num_FP += 1
+            elif prediction_labels[i] != OvR and true_labels[i] == OvR:
+                num_FN += 1
+            else:
+                raise ValueError(
+                    "Invalid Case in confusion_matrix(), something went wrong"
+                )
+        return (num_TP, num_TN, num_FP, num_FN)
+
+    def log_confusion_matrix(
+        self, OvR, confusion_matrix_file=None, confusion_matrix_path=None
+    ):
+        confusion_matrix_str = ""
+        confusion_matrix_list = []
+
+        space = self.ConfusionMatrix().space
+        padding = self.ConfusionMatrix().padding
+        for i in range(self.__number_of_classes):
+            row = []
+            for j in range(self.__number_of_classes):
+                if i == OvR and j == OvR:
+                    TP = self.ConfusionMatrix().TP
+                    confusion_matrix_str += TP + padding * space
+                    row.append(TP)
+                elif i != OvR and j != OvR:
+                    TN = self.ConfusionMatrix().TN
+                    confusion_matrix_str += TN + padding * space
+                    row.append(TN)
+                elif i != OvR and j == OvR:
+                    FP = self.ConfusionMatrix().FP
+                    confusion_matrix_str += FP + padding * space
+                    row.append(FP)
+                elif i == OvR and j != OvR:
+                    FN = self.ConfusionMatrix().FN
+                    confusion_matrix_str += FN + padding * space
+                    row.append(FN)
+                else:
+                    raise ValueError(
+                        "Invalid Case in log_confusion_matrix(), something went wrong"
+                    )
+            confusion_matrix_str += "\n"
+            confusion_matrix_list.append(row)
+
+        _confustion_matrix_log = f"""Confusion Matrix for class : {OvR}\n{confusion_matrix_str}\nList Representation for class : {OvR}\n{confusion_matrix_list}"""
+        print()
+        print(f"\n{_confustion_matrix_log}\n")
+        print()
+
+        if confusion_matrix_file is None:
+            confusion_matrix_file = self.Paths().confusion_matrix_file
+            confusion_matrix_path = self.Paths().confusion_matrix_path
+        if not os.path.exists(confusion_matrix_path):
+            os.mkdir(confusion_matrix_path)
+        confusion_matrix_full_path = (
+            confusion_matrix_path + confusion_matrix_file + self.Extensions().text
+        )
+        with open(confusion_matrix_full_path, "a") as f:
+            f.write(
+                f"\n\nModel Train Confusion Matrices for date : {datetime.utcnow().isoformat() + "Z"}\n\n"
+            )
+            f.write(_confustion_matrix_log)
+        print(f"\nError Analysis Are written to : {confusion_matrix_path}\n")
+
+    def data_augmentation(self, X, Y, augmentation_type, random_range=None):
+        xp = self.xp
+
+        X = xp.asarray(X, dtype=xp.float32)
+        Y = xp.asarray(Y)
+
+        X_aug = X.copy()
+        Y_aug = Y.copy()
+
+        if self.on_gpu:
+            random_range = xp.random
+        elif random_range is None:
+            random_range = np.random.default_rng()
+
+        match augmentation_type:
+            case self.DataAugmentation.JITTER_NOISE:
+                jitter_strength = 0.03
+                noise = random_range.uniform(
+                    -jitter_strength, jitter_strength, size=X_aug.shape
+                )
+                X_aug = X_aug + noise
+
+            case self.DataAugmentation.MEASUREMENT_NOISE:
+                measurement_strength = 0.02
+                scale = random_range.uniform(
+                    1.0 - measurement_strength,
+                    1.0 + measurement_strength,
+                    size=X_aug.shape,
+                )
+                X_aug = xp.maximum(0.0, X_aug * scale)
+
+            case self.DataAugmentation.SAME_CLASS_INTERPOLATION:
+                if Y_aug.shape[1] == 1:
+                    labels = Y_aug.flatten().astype(int)
+                else:
+                    labels = xp.argmax(Y_aug, axis=1)
+
+                synthetic_x = []
+                synthetic_y = []
+
+                for label in xp.unique(labels):
+                    indices = xp.where(labels == label)[0]
+                    num_synthetic = len(indices) // 2
+
+                    for _ in range(num_synthetic):
+                        if len(indices) >= 2:
+                            i1, i2 = random_range.choice(indices, size=2, replace=False)
+                        else:
+                            i1 = i2 = indices[0]
+
+                        alpha = random_range.uniform(0.2, 0.8)
+
+                        x_new = alpha * X_aug[i1] + (1.0 - alpha) * X_aug[i2]
+                        y_new = Y_aug[i1].copy()
+
+                        synthetic_x.append(x_new)
+                        synthetic_y.append(y_new)
+
+                if synthetic_x:
+                    synthetic_x = xp.stack(synthetic_x, axis=0)
+                    synthetic_y = xp.stack(synthetic_y, axis=0)
+
+                    X_aug = xp.concatenate([X_aug, synthetic_x], axis=0)
+                    Y_aug = xp.concatenate([Y_aug, synthetic_y], axis=0)
+
+            case _:
+                raise ValueError(
+                    f"Unknown Data Augmentation Type, supported values are : {self.DataAugmentation.MEASUREMENT_NOISE}, {self.DataAugmentation.JITTER_NOISE}, {self.DataAugmentation.SAME_CLASS_INTERPOLATION}"
+                )
+
+        return X_aug, Y_aug
+
+    @staticmethod
+    def one_hot_encode(Y, classes):
+        if type(Y) is not np.ndarray:
+            return None
+        if type(classes) is not int:
+            return None
+        try:
+            Y = Y.flatten()
+            one_hot = np.eye(classes)[Y]
+            return one_hot
+        except Exception:
+            return None
+
+    @staticmethod
+    def one_hot_decode(one_hot):
+        if type(one_hot) is not np.ndarray or len(one_hot.shape) != 2:
+            return None
+        vector = one_hot.argmax(axis=1)
+        return vector
+
+    def get_metadata(self, format_version=None, train_history=None):
+        if format_version is None:
+            format_version = self.TrainDefaults().default_format_version
+        state = {
+            "format_version": format_version,
+            "saved_at": datetime.utcnow().isoformat() + "Z",
+            "number_of_layers": self.__L,
+            "hidden_activation_type": self.__hidden_activation_type.name,
+            "output_activation_type": self.__output_activation_type.name,
+            "loss_type": self.__loss_type.name,
+            "parameter_count": self.count_parameters(),
+        }
+        if train_history is not None:
+            state["train_history"] = train_history
+        return state
+
+    def save_model(
+        self, file_name, meta=False, format_version=None, train_history=False
+    ):
+        if not file_name.endswith(".pkl"):
+            file_name = file_name + ".pkl"
+
+        modelpath = self.Paths.model_path
+        if modelpath is not None and not os.path.exists(modelpath):
+            os.mkdir(modelpath)
+
+        model_cpu = self.cpu_copy()
+
+        file_path = modelpath + file_name
+        with open(file_path, "wb") as f:
+            pickle.dump(model_cpu, f)
+        print(f"\nSaved the Model to : {file_path}\n")
+
+        if meta:
+            meta_data = self.get_metadata(format_version, train_history)
+            meta_data_path = modelpath + file_name + self.Paths.meta_data_flair
+            with open(meta_data_path, "wb") as f:
+                pickle.dump(meta_data, f)
+            print(f"\nSaved Meta Data at : {meta_data_path}\n")
+
+    @classmethod
+    def load_model(cls, model_path, meta_data_path=None, device=None, meta=False):
+        with open(model_path, "rb") as f:
+            model = pickle.load(f)
+        print(f"Loaded Model from : {model_path}\n")
+        if device is not None:
+            model.move_to(device)
+        meta_data = None
+        if meta and meta_data_path is not None:
+            with open(meta_data_path, "rb") as f:
+                meta_data = pickle.load(f)
+            print(f"Loaded Meta data from : {meta_data_path}\n")
+        return model, meta_data
+
+    @classmethod
+    def load_from_npz(cls, npz_path):
+        lib = np.load(npz_path)
+
+        X_train_3D = lib["X_train"]
+        Y_train = lib["Y_train"]
+
+        X_valid_3D = lib["X_valid"]
+        Y_valid = lib["Y_valid"]
+
+        X_test_3D = lib["X_test"]
+        Y_test = lib["Y_test"]
+
+        X_train = X_train_3D.reshape((X_train_3D.shape[0], -1))
+        X_valid = X_valid_3D.reshape((X_valid_3D.shape[0], -1))
+        X_test = X_test_3D.reshape((X_test_3D.shape[0], -1))
+
+        return {
+            "X_train": X_train,
+            "Y_train": Y_train.astype(np.int64),
+            "X_valid": X_valid,
+            "Y_valid": Y_valid.astype(np.int64),
+            "X_test": X_test,
+            "Y_test": Y_test.astype(np.int64),
+        }
+
+    @classmethod
+    def save_to_npz(cls, filename=None, compressed=False, **kwargs):
+        npz_path = cls.Paths.npz_path
+        if filename is None:
+            filename = cls.Paths.default_data
+
+        npz_extension = cls.Extensions.npz
+        if not filename.endswith(npz_extension):
+            filename = filename + npz_extension
+
+        npz_file_path = npz_path
+        if npz_file_path is not None and not os.path.exists(npz_file_path):
+            os.mkdir(npz_file_path)
+
+        filepath = npz_file_path + filename
+
+        if compressed:
+            np.savez_compressed(filepath, **kwargs)
+        else:
+            np.savez(filepath, **kwargs)
+
+    @classmethod
+    def save_to_csv(cls, X, Y, filename):
+        if filename is None:
+            filename = cls.TrainResults().default_data
+        if not filename.endswith(cls.Extensions.csv):
+            filename = filename + cls.Extensions.csv
+        csv_file_path = cls.TrainResults().csv_path
+        if csv_file_path is not None and not os.path.exists(csv_file_path):
+            os.mkdir(csv_file_path)
+
+        filepath = csv_file_path + filename
+
+        n_features = X.shape[1]
+        header = [f"f{i}" for i in range(n_features)] + ["label"]
+
+        with open(filepath, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+
+            for x_row, y_value in zip(X, Y):
+                writer.writerow(list(map(float, x_row)) + [int(y_value)])
+        print(f"\nSaved data to CSV at : {filepath}\n")
+
+    @classmethod
+    def load_from_csv(cls, filepath, _newline="", _encoding=None):
+        if _encoding is None:
+            _encoding = cls.Encodings().UTF_8
+        with open(filepath, "r", newline=_newline, encoding=_encoding) as f:
+            reader = csv.reader(f)
+            header = next(reader)
+
+            rows = list(reader)
+        print(f"\nLoaded a CSV dataset from : {filepath}\n")
+
+        data = np.array(rows, dtype=np.float32)
+
+        X = data[:, :-1]
+        Y = data[:, -1].astype(np.int64)
+
+        return X, Y
+
+    @classmethod
+    def split_to_records(cls, X, Y):
+        records = []
+
+        for x_row, y_value in zip(X, Y):
+            records.append({"features": x_row.tolist(), "label": int(y_value)})
+        return records
+
+    @classmethod
+    def save_to_json(cls, dataset, filename=None, _encoding=None):
+        if filename is None:
+            filename = cls.TrainResults().default_data
+        if not filename.endswith(cls.Extensions.json):
+            filename = filename + cls.Extensions.json
+        json_file_path = cls.TrainResults().json_path
+        if json_file_path is not None and not os.path.exists(json_file_path):
+            os.mkdir(json_file_path)
+
+        filepath = json_file_path + filename
+
+        if _encoding is None:
+            _encoding = cls.Encodings().UTF_8
+
+        json_data = {
+            "train": cls.split_to_records(dataset["X_train"], dataset["Y_train"]),
+            "valid": cls.split_to_records(dataset["X_valid"], dataset["Y_valid"]),
+            "test": cls.split_to_records(dataset["X_test"], dataset["Y_test"]),
+        }
+
+        with open(filepath, "w", encoding=_encoding) as f:
+            json.dump(json_data, f)
+        print(f"\nSaved data to JSON at : {filepath}\n")
+
+    @classmethod
+    def records_to_split(cls, records):
+        X = np.array([r["features"] for r in records], dtype=np.float32)
+        Y = np.array([r["label"] for r in records], dtype=np.int64)
+        return X, Y
+
+    @classmethod
+    def load_from_json(cls, filepath, _encoding=None):
+        if _encoding is None:
+            _encoding = cls.Encodings.UTF_8
+
+        with open(filepath, "r", encoding=_encoding) as f:
+            data = json.load(f)
+        print(f"Loaded data from JSON at : {filepath}\n")
+
+        X_train, Y_train = cls.records_to_split(data["train"])
+        X_valid, Y_valid = cls.records_to_split(data["valid"])
+        X_test, Y_test = cls.records_to_split(data["test"])
+
+        return {
+            "X_train": X_train,
+            "Y_train": Y_train,
+            "X_valid": X_valid,
+            "Y_valid": Y_valid,
+            "X_test": X_test,
+            "Y_test": Y_test,
+        }
+
+    @classmethod
+    def save_to_pickle(cls, dataset, filename=None):
+        if filename is None:
+            filename = cls.TrainResults().default_data
+        if not filename.endswith(cls.Extensions.pickle):
+            filename = filename + cls.Extensions.pickle
+        pickle_file_path = cls.TrainResults().pickle_path
+        if pickle_file_path is not None and not os.path.exists(pickle_file_path):
+            os.mkdir(pickle_file_path)
+
+        filepath = pickle_file_path + filename
+
+        with open(filepath, "wb") as f:
+            pickle.dump(dataset, f)
+        print(f"\nSaved data to Pickle at : {pickle_file_path}\n")
+
+    @classmethod
+    def load_from_pickle(cls, filepath):
+        with open(filepath, "rb") as f:
+            dataset = pickle.load(f)
+        print(f"\nLoaded data from Pickle at : {filepath}\n")
+        return dataset
+
+    @classmethod
+    def prepare_datasets(cls, dataset, number_of_classes=None):
+        X_train = dataset["X_train"]
+        Y_train = dataset["Y_train"]
+
+        X_valid = dataset["X_valid"]
+        Y_valid = dataset["Y_valid"]
+
+        X_test = dataset["X_test"]
+        Y_test = dataset["Y_test"]
+        
+        if number_of_classes is None:
+            number_of_classes = Y_train.shape[1]
+
+        Y_train_one_hot = cls.one_hot_encode(Y_train, number_of_classes)
+        Y_valid_one_hot = cls.one_hot_encode(Y_valid, number_of_classes)
+        Y_test_one_hot = cls.one_hot_encode(Y_test, number_of_classes)
+
+        return {
+            "X_train": X_train,
+            "Y_train": Y_train_one_hot,
+            "X_valid": X_valid,
+            "Y_valid": Y_valid_one_hot,
+            "X_test": X_test,
+            "Y_test": Y_test_one_hot,
+        }
+
+    @classmethod
+    def load_dataset(cls, file_type, file_path):
+        match file_type:
+            case cls.Datasets.NPZ:
+                return cls.load_from_npz(file_path)
+            case cls.Datasets.JSON:
+                return cls.load_from_json(file_path)
+            case cls.Datasets.PICKLE:
+                return cls.load_from_pickle(file_path)
+            case _:
+                raise ValueError(
+                    f"Unknown File Type, supported ones are : {cls.Datasets.NPZ}, {cls.Datasets.PICKLE}, {cls.Datasets.JSON}"
+                )
+
+    @classmethod
+    def load_csv_datasets(cls, folder):
+        X_train, Y_train = cls.load_from_csv(f"{folder}/train.csv")
+        X_valid, Y_valid = cls.load_from_csv(f"{folder}/valid.csv")
+        X_test, Y_test = cls.load_from_csv(f"{folder}/test.csv")
+
+        return {
+            "X_train": X_train,
+            "Y_train": Y_train,
+            "X_valid": X_valid,
+            "Y_valid": Y_valid,
+            "X_test": X_test,
+            "Y_test": Y_test,
+        }
+
+    def __repr__(self):
+        return (
+            f"NeuralNetwork("
+            f"input_width={self.__input_width}, "
+            f"layers={self.__layers}, "
+            f"hidden_activation={self.__hidden_activation_type.name}, "
+            f"output_activation={self.__output_activation_type.name}, "
+            f"loss={self.__loss_type.name}, "
+            f"parameters={self.parameter_count()})"
+        )
+
+
+if __name__ == "__main__":
+    number_of_classes = 10
+    dataset = NeuralNetwork.load_from_npz("data/npz/MNIST.npz")
+    # json_dataset = NeuralNetwork.load_from_json('data/json/test.json')
+    # prepared_dataset = dataset
+    prepared_dataset = NeuralNetwork.prepare_datasets(dataset, number_of_classes)
+
+    X_train = prepared_dataset["X_train"]
+    Y_train = prepared_dataset["Y_train"]
+    X_valid = prepared_dataset["X_valid"]
+    Y_valid = prepared_dataset["Y_valid"]
+    X_test = prepared_dataset["X_test"]
+    Y_test = prepared_dataset["Y_test"]
+    
+    X_train = X_train.astype(np.float32) / 255.0
+    X_valid = X_valid.astype(np.float32) / 255.0
+    X_test = X_test.astype(np.float32) / 255.0
+
+    number_of_features = X_train.shape[1]
+    layers = [256, 128, 64, number_of_classes]
+    # layers = NeuralNetwork.init_layers(
+    #     X=X_train, number_of_hidden_layers=1, output_width=number_of_classes
+    # )
+    
+    cfg = NeuralNetwork.TrainDefaults()
+
+    # limit = 101
+    cfg.step = 10
+    cfg.epochs = 120
+    cfg.batch_size = 512
+    cfg.learning_rate = 0.001
+    cfg.l2_lambda = 0.3
+    cfg.decay_factor = 0.5
+
+    model = NeuralNetwork(
+        number_of_features,
+        number_of_classes,
+        layers,
+        loss_type=NeuralNetwork.LossType.MULTI_CLASS_CROSS_ENTROPY,
+        output_activation_type=NeuralNetwork.OutputActivationType.SOFTMAX,
+        hidden_activation_type=NeuralNetwork.HiddenActivationType.TANH,
+        device=NeuralNetwork.Device.GPU,
+        hidden_weight_init_strategy=NeuralNetwork.WeightInitStrategy.HE_UNIFORM,
+        output_weight_init_strategy=NeuralNetwork.WeightInitStrategy.XAVIER_UNIFORM,
+        bias_init_strategy=NeuralNetwork.BiasInitStrategy.ZERO,
+        config=cfg,
+    )
+
+    # model.summary()
+
+    X_train = model.to_device(X_train, dtype=model.xp.float32)
+    Y_train = model.to_device(Y_train, dtype=model.xp.float32)
+
+    X_valid = model.to_device(X_valid, dtype=model.xp.float32)
+    Y_valid = model.to_device(Y_valid, dtype=model.xp.float32)
+
+    X_test = model.to_device(X_test, dtype=model.xp.float32)
+    Y_test = model.to_device(Y_test, dtype=model.xp.float32)
+
+    # X_train = X_train[:limit]
+    # Y_train = Y_train[:limit]
+    # X_valid = X_valid[:limit]
+    # Y_valid = Y_valid[:limit]
+    # X_test = X_test[:limit]
+    # Y_test = Y_test[:limit]
+
+    results = model.train(
+        X_train,
+        Y_train,
+        X_valid,
+        Y_valid,
+        X_test,
+        Y_test,
+        learning_decay_type=None,
+        data_augmentation_type=None,
+        cfg=cfg,
+        _log=True,
+        early_stopping=True,
+        restore_best=True,
+        finalize=True,
+        l2=False,
+        dropout=False,
+        graph=False,
+        synch=False,
+        real_time_tracking=False,
+        _log_predictions=False,
+        error_analysis=False,
+        _log_confusion_matrix=False,
+        _log_error_analysis=False,
+        optimizer_type=NeuralNetwork.Optimizers.ADAM,
+    )
+
+    model_name = "trained_model_digit_recognizer"
+    model.save_model(model_name)
+
+    loaded_model = NeuralNetwork.load_model(
+        f"models/{model_name}.pkl", device=NeuralNetwork.Device.CPU
+    )
