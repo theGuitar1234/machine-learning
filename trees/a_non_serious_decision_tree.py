@@ -62,7 +62,7 @@ class ANonSeriousDecisionTree:
     class XGBoostSplit(Enum):
         EXACT = 1
         APPROXIMATE = 2
-    
+
     class DefaultMissingValueDirection(Enum):
         RIGHT = 1
         LEFT = 2
@@ -70,7 +70,6 @@ class ANonSeriousDecisionTree:
     @dataclass
     class TrainDefaults:
         epsilon: float = 1e-5
-        max_xgboost_bins: int = 32
 
     def __init__(
         self,
@@ -91,25 +90,32 @@ class ANonSeriousDecisionTree:
         tree_type=TreeType.CLASSIFICATION,
         error=Error.MSE,
         vectorized=False,
-        config=TrainDefaults(),
         xgboost=False,
         xgboost_split=None,
         xgboost_proposal=None,
         xgboost_candidate_proposal=None,
+        xgboost_optimized=False,
         missing_value=np.nan,
         preprocess=False,
-        xgboost_optimized=False,
         purpose_missing=False,
         batch_training=False,
+        catboost=False,
+        config=TrainDefaults(),
     ):
         if categorical and vectorized:
-            raise RuntimeError("Categorical data can't be used for vectorized search")
+            raise RuntimeError(
+                "Categorical data can't be used for vectorized prediction"
+            )
         if xgboost and tree_type is not self.TreeType.REGRESSION:
             raise RuntimeError("XGBoost uses Regression Trees")
         if preprocess and not xgboost:
-            raise RuntimeError("Column preprocessing is currently only supported for XGBoost-style trees")
-        self.rng = np.random.default_rng(seed)
-        self.root = None
+            raise RuntimeError(
+                "Column preprocessing is currently only supported for XGBoost-style trees"
+            )
+        if categorical and catboost:
+            raise RuntimeError(
+                "Catboost already handles categorical data, turn catboost or categorical off"
+            )
         self.max_depth = max_depth
         self.adjacent = adjacent
         self.minimum_population_size = minimum_population_size
@@ -119,7 +125,7 @@ class ANonSeriousDecisionTree:
         self.log = log
         self.is_root_set = False
         self.str_max_depth = str_max_depth
-        self.feature_importance = {}
+        self.feature_importances = {}
         self.max_depth_reached = "MAX_DEPTH_REACHED"
         self.random_criterion = random_criterion
         self.max_features_ratio = max_features_ratio
@@ -129,18 +135,22 @@ class ANonSeriousDecisionTree:
         self.error = error
         self.vectorized = vectorized
         self.categorical = categorical
-        self.config = config
         self.xgboost = xgboost
         self.xgboost_split = xgboost_split
         self.xgboost_proposal = xgboost_proposal
         self.xgboost_candidate_proposal = xgboost_candidate_proposal
+        self.xgboost_optimized = xgboost_optimized
         self.missing_value = missing_value
         self.preprocess = preprocess
-        self.xgboost_optimized = xgboost_optimized
         self.purpose_missing = purpose_missing
         self.batch_training = batch_training
+        self.catboost = catboost
+        self.catboost_statistics = {}
+        self.config = config
         self.preprocessed_columns = None
         self.global_candidates = None
+        self.rng = np.random.default_rng(seed)
+        self.root = None
 
     def __str__(self):
         return str(self.root)
@@ -177,8 +187,54 @@ class ANonSeriousDecisionTree:
         _node.depth = node.depth + 1
         _node.sub_population = sub_population
         return _node
-    
-    def preprocess_columns(self, X):
+
+    def _majority_class(self, y):
+        values, counts = np.unique(y, return_counts=True)
+        return values[np.argmax(counts)]
+
+    def _class_counts(self, y):
+        counts = np.zeros(len(self.classes_))
+        for i, cls in enumerate(self.classes_):
+            counts[i] = np.sum(y == cls)
+        return counts
+
+    def _route_node_data(self, values, threshold):
+        if self.categorical:
+            left_mask = values == threshold
+            right_mask = values != threshold
+        else:
+            left_mask = values > threshold
+            right_mask = values <= threshold
+        return left_mask, right_mask
+
+    def _route_missing_node_data(self, values, threshold, node):
+        missing_mask = self._missing_mask(values)
+        observed_mask = ~missing_mask
+        if (
+            node.default_missing_value_direction
+            is self.DefaultMissingValueDirection.LEFT
+        ):
+            left_mask = ((values > threshold) & observed_mask) | missing_mask
+            right_mask = (values <= threshold) & observed_mask
+        else:
+            left_mask = (values > threshold) & observed_mask
+            right_mask = ((values <= threshold) & observed_mask) | missing_mask
+        return left_mask, right_mask
+
+    def _prune_node(self, node):
+        node.is_leaf = True
+        node.number_of_leaves = 1
+        node.subtree_error = node.leaf_error
+        node.left = None
+        node.right = None
+        node.feature = None
+        node.threshold = None
+        node.value = node.majority_class
+
+    def _update_bounds(self):
+        self.root.update_bounds_below()
+
+    def _preprocess_columns(self, X):
         blocks = {}
         for feature in range(X.shape[1]):
             values = X[:, feature]
@@ -192,7 +248,83 @@ class ANonSeriousDecisionTree:
                 "missing_rows": np.where(missing_mask)[0],
             }
         return blocks
-        
+
+    def _is_missing_scalar(self, value):
+        if self.missing_value is None:
+            return np.isnan(value)
+        if isinstance(self.missing_value, float) and np.isnan(self.missing_value):
+            return np.isnan(value)
+        return value == self.missing_value
+
+    def mse(self, y, y_hat):
+        return np.mean((y - y_hat) ** 2)
+
+    def mse_mean(self, y):
+        return np.mean((y - np.mean(y)) ** 2)
+
+    def sse(self, y, y_hat):
+        return np.sum((y - y_hat) ** 2)
+
+    def rmse(self, y, y_hat):
+        return np.sqrt(self.mse(y, y_hat))
+
+    def r2(self, y, y_hat):
+        ss_res = np.sum((y - y_hat) ** 2)
+        ss_total = np.sum((y - np.mean(y)) ** 2)
+        if ss_total == 0:
+            return 0
+        return 1 - ss_res / ss_total
+
+    def weighted_mse(self, left_y, right_y):
+        total = len(left_y) + len(right_y)
+        return len(left_y) / total * self.mse_mean(left_y) + len(
+            right_y
+        ) / total * self.mse_mean(right_y)
+
+    def gini(self, y):
+        if len(y) == 0:
+            return 0
+        _, counts = np.unique(y, return_counts=True)
+        proportions = counts / len(y)
+        return 1 - np.sum(proportions**2)
+
+    def entropy(self, y):
+        if len(y) == 0:
+            return 0
+        _, counts = np.unique(y, return_counts=True)
+        proportions = counts / len(y)
+        return -np.sum(proportions * np.log2(proportions + self.config.epsilon))
+
+    def weighted_impurity(self, left, right, left_size, right_size):
+        total_size = left_size + right_size
+        return (left_size / total_size) * left + (right_size / total_size) * right
+
+    def ucf(self, errors, total, confidence_factor=0.25):
+        if total == 0:
+            return 0.0
+        if errors == 0:
+            return 1.0 - confidence_factor ** (1.0 / total)
+        if errors == total:
+            return 1.0
+
+        low = errors / total
+        high = 1.0
+
+        while high - low > self.config.epsilon:
+            mid = (low + high) / 2
+            probability = self.binomial_cdf(errors, total, mid)
+            if probability > confidence_factor:
+                low = mid
+            else:
+                high = mid
+        return high
+
+    def binomial_cdf(self, errors, total, p):
+        return sum(
+            math.comb(total, i) * (p**i) * ((1 - p) ** (total - i))
+            for i in range(errors + 1)
+        )
+
     def fit(
         self,
         X,
@@ -210,7 +342,7 @@ class ANonSeriousDecisionTree:
             )
         root_row_indices = None
         if self.xgboost and self.preprocess:
-            self.preprocessed_columns = self.preprocess_columns(X)
+            self.preprocessed_columns = self._preprocess_columns(X)
             root_row_indices = np.arange(X.shape[0])
         self.X_train_ = X
         self.y_train_ = y
@@ -232,18 +364,33 @@ class ANonSeriousDecisionTree:
                 self.global_candidates = {}
                 for feature in range(X.shape[1]):
                     self.global_candidates[feature] = self.weighted_quantile_candidates(
-                        feature=feature, values=X[:, feature], hessian=hessian, row_indices=root_row_indices
+                        feature=feature,
+                        values=X[:, feature],
+                        hessian=hessian,
+                        row_indices=root_row_indices,
                     )
+        if self.catboost:
+            self.X_train_ = self._catboost_fit_ordered_target_statistics(X, y)
 
         if node:
             self.root = ANonSeriousNode()
             self.root.is_root = True
             self.root.depth = 0
             self.root.sub_population = np.ones(self.X_train_.shape[0], dtype=bool)
-            self.fit_node(node=self.root, gradient=gradient, hessian=hessian, row_indices=root_row_indices)
+            self.fit_node(
+                node=self.root,
+                gradient=gradient,
+                hessian=hessian,
+                row_indices=root_row_indices,
+            )
         else:
             self.root = self._build_tree(
-                self.X_train_, self.y_train_, depth=0, row_indices=root_row_indices, gradient=self.gradient_, hessian=self.hessian_
+                self.X_train_,
+                self.y_train_,
+                depth=0,
+                row_indices=root_row_indices,
+                gradient=self.gradient_,
+                hessian=self.hessian_,
             )
 
         if verbose:
@@ -254,38 +401,20 @@ class ANonSeriousDecisionTree:
     - Number of nodes           : {self.count_nodes()}
     - Number of leaves          : {number_of_leaves}
     - Accuracy on training data : {accuracy}""")
-
-            print("\nFeature Importances :")
-            total = sum(self.feature_importance.values())
-            for key, value in self.feature_importance.items():
-                print(f"For feature{key}, importance is {(value/total) * 100}%")
-
-            features = self.feature_importance.keys()
-            values = [(v / total) * 100 for v in self.feature_importance.values()]
-            plt.figure("Feature Importances")
-            plt.xlabel("Features")
-            plt.ylabel("Values")
-            plt.barh(features, values)
-
-            os.makedirs("img", exist_ok=True)
-
-            plt.savefig("img/ftr_mprtncs.png")
-            plt.show()
-
         return self
 
     def _build_tree(self, X, y, depth, row_indices=None, gradient=None, hessian=None):
-        if self.preprocess:
-            y = self.y_train_[row_indices]
-            gradient = self.gradient_[row_indices]
-            hessian = self.hessian_[row_indices]
         node = ANonSeriousNode()
         if not self.is_root_set:
             node.is_root = True
             self.is_root_set = True
-
         node.depth = depth
         node.max_depth = self.str_max_depth
+
+        if self.preprocess:
+            y = self.y_train_[row_indices]
+            gradient = self.gradient_[row_indices]
+            hessian = self.hessian_[row_indices]
         match self.tree_type:
             case self.TreeType.CLASSIFICATION:
                 node.majority_class = self._majority_class(y)
@@ -325,7 +454,14 @@ class ANonSeriousDecisionTree:
             case self.TreeType.CLASSIFICATION:
                 feature, threshold = self._classification_split(X, y)
             case self.TreeType.REGRESSION:
-                feature, threshold = self._regression_split(X, y, gradient=gradient, hessian=hessian, node=node, row_indices=row_indices)
+                feature, threshold = self._regression_split(
+                    X,
+                    y,
+                    gradient=gradient,
+                    hessian=hessian,
+                    node=node,
+                    row_indices=row_indices,
+                )
             case _:
                 raise ValueError(
                     f"Unsupported {self.tree_type}, supported values are {list(self.TreeType)}"
@@ -354,29 +490,17 @@ class ANonSeriousDecisionTree:
         node.feature = feature
         node.threshold = threshold
         node.value = None
-        
+
         values = X[:, feature]
         if row_indices is not None:
             values = self.X_train_[row_indices, feature]
-        
-        if node.default_missing_value_direction is None:
-            if self.categorical:
-                left_mask = values == threshold
-                right_mask = values != threshold
-            else:
-                left_mask = values > threshold
-                right_mask = values <= threshold
-        else:
-            feature = node.feature
-            missing_mask = self._missing_mask(values)
-            observed_mask = ~missing_mask
-            if node.default_missing_value_direction is self.DefaultMissingValueDirection.LEFT:
-                left_mask = ((values > threshold) & observed_mask) | missing_mask
-                right_mask = ((values <= threshold) & observed_mask)
-            else:
-                left_mask = ((values > threshold) & observed_mask)
-                right_mask = ((values <= threshold) & observed_mask) | missing_mask
 
+        if node.default_missing_value_direction is None:
+            left_mask, right_mask = self._route_node_data(values, threshold)
+        else:
+            left_mask, right_mask = self._route_missing_node_data(
+                values, threshold, node
+            )
         if (
             len(X[left_mask]) < self.minimum_split_size
             or len(X[right_mask]) < self.minimum_split_size
@@ -395,7 +519,7 @@ class ANonSeriousDecisionTree:
                         f"Unsupported {self.TreeType}, supported values are {list(self.TreeType)}"
                     )
             return node
-        
+
         left_rows_indices = None
         right_rows_indices = None
         if row_indices is not None:
@@ -437,10 +561,10 @@ class ANonSeriousDecisionTree:
                 row_indices = np.where(node.sub_population)[0]
             else:
                 row_indices = np.arange(self.X_train_.shape[0])
-        
+
         X = self.X_train_[row_indices]
         y = self.y_train_[row_indices]
-                
+
         if self.xgboost and (gradient is not None and hessian is not None):
             node.gradient = self.gradient_[row_indices]
             node.hessian = self.hessian_[row_indices]
@@ -482,7 +606,14 @@ class ANonSeriousDecisionTree:
             case self.TreeType.CLASSIFICATION:
                 feature, threshold = self._classification_split(X, y)
             case self.TreeType.REGRESSION:
-                feature, threshold = self._regression_split(X, y, gradient=gradient, hessian=hessian, node=node, row_indices=row_indices)
+                feature, threshold = self._regression_split(
+                    X,
+                    y,
+                    gradient=gradient,
+                    hessian=hessian,
+                    node=node,
+                    row_indices=row_indices,
+                )
             case _:
                 raise ValueError(
                     f"Unsupported {self.tree_type}, supported values are {list(self.TreeType)}"
@@ -515,21 +646,11 @@ class ANonSeriousDecisionTree:
 
         values = self.X_train_[row_indices, feature]
         if node.default_missing_value_direction is None:
-            if self.categorical:
-                left_mask = values == threshold
-                right_mask = values != threshold
-            else:
-                left_mask = values > threshold
-                right_mask = values <= threshold
+            left_mask, right_mask = self._route_node_data(values, threshold)
         else:
-            missing_mask = self._missing_mask(values)
-            observed_mask = ~missing_mask
-            if node.default_missing_value_direction is self.DefaultMissingValueDirection.LEFT:
-                left_mask = ((values > threshold) & observed_mask) | missing_mask
-                right_mask = ((values <= threshold) & observed_mask)
-            else:
-                left_mask = ((values > threshold) & observed_mask)
-                right_mask = ((values <= threshold) & observed_mask) | missing_mask
+            left_mask, right_mask = self._route_missing_node_data(
+                values, threshold, node
+            )
         left_rows = row_indices[left_mask]
         right_rows = row_indices[right_mask]
 
@@ -563,177 +684,13 @@ class ANonSeriousDecisionTree:
         node.right.sub_population[right_rows] = True
 
         self.fit_node(
-            node.left, row_indices=left_rows,
+            node.left,
+            row_indices=left_rows,
         )
         self.fit_node(
-            node.right, row_indices=right_rows,
+            node.right,
+            row_indices=right_rows,
         )
-
-    def purpose_missing_values(
-        self, 
-        X, 
-        gradient, 
-        hessian, 
-        G_parent, 
-        H_parent, 
-        best_feature=None, 
-        best_threshold=None, 
-        best_gain=float("-inf")
-    ):
-        default_missing_value_direction = None
-
-        number_of_features = X.shape[1]
-        features = np.arange(number_of_features)
-        
-        for feature in features:
-            values = X[:, feature]
-            missing_mask = self._missing_mask(values)
-            observed_values = values[~missing_mask]
-            
-            order = np.argsort(observed_values)
-            observed_indices = np.where(~missing_mask)[0]
-            sorted_observed_indices = observed_indices[order]
-            sorted_values = values[sorted_observed_indices]
-            
-            value_range = len(sorted_values) - 1
-            sorted_gradient = gradient[sorted_observed_indices]
-            sorted_hessian = hessian[sorted_observed_indices]
-
-            best_gain_right, best_threshold_right = self._missing_values_default_right(
-                sorted_values=sorted_values, 
-                value_range=value_range, 
-                sorted_gradient=sorted_gradient, 
-                sorted_hessian=sorted_hessian, 
-                G_parent=G_parent, 
-                H_parent=H_parent, 
-                best_gain=best_gain,
-                best_threshold=best_threshold,
-            )
-            best_gain_left, best_threshold_left = self._missing_values_default_left(
-                sorted_values=sorted_values, 
-                value_range=value_range, 
-                sorted_gradient=sorted_gradient, 
-                sorted_hessian=sorted_hessian, 
-                G_parent=G_parent, 
-                H_parent=H_parent, 
-                best_gain=best_gain,
-                best_threshold=best_threshold,
-            )
-            
-            if best_gain_right is not None and best_gain_right > best_gain:
-                best_feature = feature
-                best_gain = best_gain_right
-                best_threshold = best_threshold_right
-                default_missing_value_direction = self.DefaultMissingValueDirection.RIGHT
-            if best_gain_left is not None and best_gain_left > best_gain:
-                best_feature = feature
-                best_gain = best_gain_left
-                best_threshold = best_threshold_left
-                default_missing_value_direction = self.DefaultMissingValueDirection.LEFT
-        return best_feature, best_threshold, default_missing_value_direction
-
-    def _missing_mask(self, values):
-        if self.missing_value is None:
-            return np.isnan(values)
-        if isinstance(self.missing_value, float) and np.isnan(self.missing_value):
-            return np.isnan(values)   
-        return values == self.missing_value
-
-    def _missing_values_default_left(
-        self,
-        sorted_values,
-        value_range,
-        sorted_gradient,
-        sorted_hessian,
-        G_parent,
-        H_parent,
-        best_threshold=None,
-        best_gain=float("-inf"),
-    ):
-        G_right = 0.0
-        H_right = 0.0
-
-        for boundary in range(value_range):
-            G_right += sorted_gradient[boundary]
-            H_right += sorted_hessian[boundary]
-
-            if sorted_values[boundary] == sorted_values[boundary + 1]:
-                continue
-            right_count = boundary + 1
-            left_count = len(sorted_values) - right_count
-
-            if (
-                left_count < self.minimum_split_size
-                or right_count < self.minimum_split_size
-            ):
-                continue
-            G_left = G_parent - G_right
-            H_left = H_parent - H_right
-
-            gain = self._xgboost_gain(
-                G_parent=G_parent,
-                G_left=G_left,
-                G_right=G_right,
-                H_parent=H_parent,
-                H_left=H_left,
-                H_right=H_right,
-            )
-            if gain > best_gain:
-                best_gain = gain
-                best_threshold = (
-                    sorted_values[boundary] + sorted_values[boundary + 1]
-                ) / 2
-        if best_gain <= 0:
-            return None, None
-        return best_gain, best_threshold
-       
-    def _missing_values_default_right(
-        self, 
-        sorted_values,
-        value_range,
-        sorted_gradient,
-        sorted_hessian,
-        G_parent,
-        H_parent,
-        best_threshold=None,
-        best_gain=float("-inf"),
-    ):
-        G_left = 0.0
-        H_left = 0.0
-
-        for boundary in range(value_range):
-            G_left += sorted_gradient[boundary]
-            H_left += sorted_hessian[boundary]
-
-            if sorted_values[boundary] == sorted_values[boundary + 1]:
-                continue
-            left_count = boundary + 1
-            right_count = len(sorted_values) - left_count
-
-            if (
-                right_count < self.minimum_split_size
-                or left_count < self.minimum_split_size
-            ):
-                continue
-            G_right = G_parent - G_left
-            H_right = H_parent - H_left
-
-            gain = self._xgboost_gain(
-                G_parent=G_parent,
-                G_left=G_left,
-                G_right=G_right,
-                H_parent=H_parent,
-                H_left=H_left,
-                H_right=H_right,
-            )
-            if gain > best_gain:
-                best_gain = gain
-                best_threshold = (
-                    sorted_values[boundary] + sorted_values[boundary + 1]
-                ) / 2
-        if best_gain <= 0:
-            return None, None
-        return best_gain, best_threshold
 
     def _classification_split(self, X, y):
         best_feature = None
@@ -783,12 +740,8 @@ class ANonSeriousDecisionTree:
                 else:
                     categories = (categories[1:] + categories[:-1]) / 2
             for category in categories:
-                if self.categorical:
-                    left_mask = values == category
-                    right_mask = values != category
-                else:
-                    left_mask = values > category
-                    right_mask = values <= category
+                left_mask, right_mask = self._route_node_data(values, category)
+
                 if np.sum(left_mask) == 0 or np.sum(right_mask) == 0:
                     continue
                 left_group = y[left_mask]
@@ -833,13 +786,15 @@ class ANonSeriousDecisionTree:
 
         impurity_decrease = __parent_impurity - best_gain
 
-        self.feature_importance[best_feature] = (
-            self.feature_importance.get(best_feature, 0) + len(y) * impurity_decrease
+        self.feature_importances[best_feature] = (
+            self.feature_importances.get(best_feature, 0) + len(y) * impurity_decrease
         )
 
         return best_feature, best_threshold
 
-    def _regression_split(self, X, y, gradient=None, hessian=None, node=None, row_indices=None):
+    def _regression_split(
+        self, X, y, gradient=None, hessian=None, node=None, row_indices=None
+    ):
         best_feature = None
         best_threshold = None
         best_score = float("inf")
@@ -857,8 +812,23 @@ class ANonSeriousDecisionTree:
             best_gain = float("-inf")
             G_parent = np.sum(gradient)
             H_parent = np.sum(hessian)
-            if self.purpose_missing and self.missing_value is not None and node is not None:
-                best_feature, best_threshold, default_missing_value_direction = self.purpose_missing_values(X=X, gradient=gradient, hessian=hessian, G_parent=G_parent, H_parent=H_parent, best_gain=best_gain, best_feature=best_feature, best_threshold=best_threshold)
+            if (
+                self.purpose_missing
+                and self.missing_value is not None
+                and node is not None
+            ):
+                best_feature, best_threshold, default_missing_value_direction = (
+                    self.purpose_missing_values(
+                        X=X,
+                        gradient=gradient,
+                        hessian=hessian,
+                        G_parent=G_parent,
+                        H_parent=H_parent,
+                        best_gain=best_gain,
+                        best_feature=best_feature,
+                        best_threshold=best_threshold,
+                    )
+                )
                 node.default_missing_value_direction = default_missing_value_direction
                 return best_feature, best_threshold
             if self.xgboost_optimized:
@@ -877,17 +847,19 @@ class ANonSeriousDecisionTree:
                             row_indices=row_indices,
                         )
                     case self.XGBoostSplit.APPROXIMATE:
-                        best_feature, best_threshold = self._xgboost_split_gain_approximate(
-                            X=X,
-                            best_feature=best_feature,
-                            best_threshold=best_threshold,
-                            features=features,
-                            gradient=gradient,
-                            hessian=hessian,
-                            G_parent=G_parent,
-                            H_parent=H_parent,
-                            best_gain=best_gain,
-                            row_indices=row_indices,
+                        best_feature, best_threshold = (
+                            self._xgboost_split_gain_approximate(
+                                X=X,
+                                best_feature=best_feature,
+                                best_threshold=best_threshold,
+                                features=features,
+                                gradient=gradient,
+                                hessian=hessian,
+                                G_parent=G_parent,
+                                H_parent=H_parent,
+                                best_gain=best_gain,
+                                row_indices=row_indices,
+                            )
                         )
                     case _:
                         raise ValueError(
@@ -923,7 +895,12 @@ class ANonSeriousDecisionTree:
                     case self.XGBoostProposal.GLOBAL:
                         thresholds = self.global_candidates[feature]
                     case self.XGBoostProposal.LOCAL:
-                        thresholds = self.propose_candidates(feature=feature, values=values, hessian=hessian, row_indices=row_indices)
+                        thresholds = self.propose_candidates(
+                            feature=feature,
+                            values=values,
+                            hessian=hessian,
+                            row_indices=row_indices,
+                        )
                     case _:
                         raise ValueError(
                             f"Unsupported {self.XGBoostProposal}, supported values are {list(self.XGBoostProposal)}"
@@ -977,6 +954,59 @@ class ANonSeriousDecisionTree:
             return None, None
         return best_feature, best_threshold
 
+    def _vectorized_split_search(self, X, y, feature):
+        if self.categorical:
+            raise RuntimeError("Categorical data can't be used for vectorized search")
+        samples = X[:, feature]
+        size = y.size
+
+        unique_values = np.unique(samples)
+        thresholds = (unique_values[1:] + unique_values[:-1]) / 2
+        if thresholds.size == 0:
+            return (0.0, np.inf)
+        one_hot = np.eye(self.classes_.size, dtype=np.int32)[
+            np.searchsorted(self.classes_, y)
+        ]
+
+        left_mask = samples[:, None] > thresholds[None, :]
+        left_counts = left_mask.T.astype(int) @ one_hot
+        total_counts = np.sum(one_hot, axis=0, keepdims=True)
+        right_counts = total_counts - left_counts
+
+        left_total = np.sum(left_counts, axis=1)
+        right_total = size - left_total
+
+        left_probability = left_counts / left_total[:, None]
+        right_probability = right_counts / right_total[:, None]
+
+        __left = None
+        __right = None
+        __weighted_average = None
+        match self.information_gain:
+            case self.InformationGain.GINI:
+                __left = 1.0 - np.sum(left_probability**2, axis=1)
+                __right = 1.0 - np.sum(right_probability**2, axis=1)
+            case self.InformationGain.ENTROPY:
+                __left = -np.sum(
+                    left_probability * np.log2(left_probability + self.config.epsilon),
+                    axis=1,
+                )
+                __right = -np.sum(
+                    right_probability
+                    * np.log2(right_probability + self.config.epsilon),
+                    axis=1,
+                )
+            case _:
+                raise ValueError(
+                    f"Unsupported {self.information_gain}, supported values are {list(self.InformationGain)}"
+                )
+        __weighted_average = self.weighted_impurity(
+            __left, __right, left_total, right_total
+        )
+        result = int(np.argmin(__weighted_average))
+
+        return float(thresholds[result]), float(__weighted_average[result])
+
     def _xgboost_split_gain_exact(
         self,
         X,
@@ -995,18 +1025,18 @@ class ANonSeriousDecisionTree:
                 block = self.preprocessed_columns[feature]
                 sorted_rows = block["rows"]
                 sorted_values = block["values"]
-                
+
                 node_row_mask = np.zeros(self.X_train_.shape[0], dtype=bool)
                 node_row_mask[row_indices] = True
-                
+
                 active_mask = node_row_mask[sorted_rows]
-                
+
                 sorted_rows = sorted_rows[active_mask]
                 sorted_values = sorted_values[active_mask]
                 sorted_gradient = self.gradient_
                 sorted_hessian = self.hessian_
                 value_range = len(sorted_rows) - 1
-                
+
                 sorted_ids = sorted_rows
             else:
                 values = X[:, feature]
@@ -1015,26 +1045,28 @@ class ANonSeriousDecisionTree:
                 value_range = len(sorted_values) - 1
                 sorted_gradient = gradient
                 sorted_hessian = hessian
-                
+
                 sorted_ids = order
 
             G_right = 0.0
             H_right = 0.0
 
             if self.batch_training:
-                best_feature, best_threshold, best_gain = self._xgboost_batch_split_exact(
-                    sorted_ids=sorted_ids,
-                    sorted_gradient=sorted_gradient,
-                    sorted_hessian=sorted_hessian,
-                    sorted_values=sorted_values,
-                    G_parent=G_parent,
-                    H_parent=H_parent,
-                    feature=feature,
-                    G_right=G_right,
-                    H_right=H_right,
-                    best_feature=best_feature,
-                    best_threshold=best_threshold,
-                    best_gain=best_gain,
+                best_feature, best_threshold, best_gain = (
+                    self._xgboost_batch_split_exact(
+                        sorted_ids=sorted_ids,
+                        sorted_gradient=sorted_gradient,
+                        sorted_hessian=sorted_hessian,
+                        sorted_values=sorted_values,
+                        G_parent=G_parent,
+                        H_parent=H_parent,
+                        feature=feature,
+                        G_right=G_right,
+                        H_right=H_right,
+                        best_feature=best_feature,
+                        best_threshold=best_threshold,
+                        best_gain=best_gain,
+                    )
                 )
             else:
                 best_feature, best_threshold, best_gain = self._xgboost_split_exact(
@@ -1101,11 +1133,9 @@ class ANonSeriousDecisionTree:
             if gain > best_gain:
                 best_gain = gain
                 best_feature = feature
-                best_threshold = (
-                    sorted_values[i] + sorted_values[i + 1]
-                ) / 2
+                best_threshold = (sorted_values[i] + sorted_values[i + 1]) / 2
         return best_feature, best_threshold, best_gain
-    
+
     def _xgboost_batch_split_exact(
         self,
         sorted_ids,
@@ -1125,25 +1155,25 @@ class ANonSeriousDecisionTree:
         batch_size = self.batch_size
         for batch_start in range(0, number_of_rows - 1, batch_size):
             batch_end = min(batch_start + batch_size, number_of_rows - 1)
-            
+
             row_id_buffer = sorted_ids[batch_start:batch_end]
-            
+
             g_buffer = sorted_gradient[row_id_buffer]
             h_buffer = sorted_hessian[row_id_buffer]
-            
+
             value_buffer = sorted_values[batch_start:batch_end]
-            next_value_buffer = sorted_values[batch_start + 1:batch_end + 1]
-            
+            next_value_buffer = sorted_values[batch_start + 1 : batch_end + 1]
+
             for j in range(batch_end - batch_start):
                 i = batch_start + j
                 G_right += g_buffer[j]
                 H_right += h_buffer[j]
-                
+
                 if value_buffer[j] == next_value_buffer[j]:
                     continue
                 right_count = i + 1
                 left_count = len(sorted_values) - right_count
-                
+
                 if (
                     left_count < self.minimum_split_size
                     or right_count < self.minimum_split_size
@@ -1151,7 +1181,7 @@ class ANonSeriousDecisionTree:
                     continue
                 G_left = G_parent - G_right
                 H_left = H_parent - H_right
-                
+
                 gain = self._xgboost_gain(
                     G_parent=G_parent,
                     G_left=G_left,
@@ -1180,7 +1210,7 @@ class ANonSeriousDecisionTree:
         best_feature=None,
         best_threshold=None,
         best_gain=float("-inf"),
-        row_indices=None
+        row_indices=None,
     ):
         for feature in features:
             values = X[:, feature]
@@ -1198,7 +1228,13 @@ class ANonSeriousDecisionTree:
                         )
                     case self.XGBoostProposal.LOCAL:
                         candidates, bucket_G, bucket_H, bucket_count = (
-                            self.weighted_quantile_buckets(values=values, gradient=gradient, hessian=hessian, feature=feature, row_indices=row_indices)
+                            self.weighted_quantile_buckets(
+                                values=values,
+                                gradient=gradient,
+                                hessian=hessian,
+                                feature=feature,
+                                row_indices=row_indices,
+                            )
                         )
                     case _:
                         raise ValueError(
@@ -1276,22 +1312,46 @@ class ANonSeriousDecisionTree:
         return best_feature, best_threshold, best_gain
 
     def _xgboost_gain(self, G_parent, G_left, G_right, H_parent, H_left, H_right):
-        return (1 / 2 * (
-            G_left**2 / (H_left + self.l2)
-            + G_right**2 / (H_right + self.l2)
-            - G_parent**2 / (H_parent + self.l2)
-        ) - self.gamma)
+        return (
+            1
+            / 2
+            * (
+                G_left**2 / (H_left + self.l2)
+                + G_right**2 / (H_right + self.l2)
+                - G_parent**2 / (H_parent + self.l2)
+            )
+            - self.gamma
+        )
+
+    def propose_candidates(self, feature, values, hessian, row_indices=None):
+        match self.xgboost_candidate_proposal:
+            case self.XGBoostCandidate.WEIGHTED_QUANTILE:
+                candidates = self.weighted_quantile_candidates(
+                    feature=feature,
+                    values=values,
+                    hessian=hessian,
+                    row_indices=row_indices,
+                )
+            case self.XGBoostCandidate.UNWEIGHTED_QUANTILE:
+                candidates = self.unweighted_quantile_candidates(values)
+            case self.XGBoostCandidate.RANDOM:
+                candidates = self.random_candidate_thresholds(values)
+            case _:
+                raise ValueError(
+                    f"Unsupported {self.XGBoostCandidate}, supported values are {list(self.XGBoostCandidate)}"
+                )
+        return candidates
 
     def weighted_quantile_candidates(self, feature, values, hessian, row_indices=None):
         if self.preprocess:
             block = self.preprocessed_columns[feature]
             sorted_rows = block["rows"]
             sorted_values = block["values"]
-            
+
             node_row_mask = np.zeros(self.X_train_.shape[0], dtype=bool)
             node_row_mask[row_indices] = True
             active_mask = node_row_mask[sorted_rows]
-            
+
             sorted_rows = sorted_rows[active_mask]
             sorted_values = sorted_values[active_mask]
             sorted_hessian = self.hessian_[sorted_rows]
@@ -1306,45 +1366,33 @@ class ANonSeriousDecisionTree:
         # total_weight = np.sum(sorted_hessian)
         total_weight = cumulative_weight[-1]
 
-        target_weights = np.linspace(0, total_weight, self.config.max_xgboost_bins + 1)[
-            1:-1
-        ]
+        target_weights = np.linspace(0, total_weight, self.max_xgboost_bins + 1)[1:-1]
 
         candidate_indices = np.searchsorted(cumulative_weight, target_weights)
         return np.unique(sorted_values[candidate_indices])
 
     def unweighted_quantile_candidates(self, values):
-        quantile_positions = np.linspace(0, 1, self.config.max_xgboost_bins + 1)[1:-1]
+        quantile_positions = np.linspace(0, 1, self.max_xgboost_bins + 1)[1:-1]
         candidates = np.quantile(values, quantile_positions)
         return np.unique(candidates)
 
     def random_candidate_thresholds(self, values):
         unique_values = np.unique(values)
-        if len(unique_values) <= self.config.max_xgboost_bins:
+        if len(unique_values) <= self.max_xgboost_bins:
             return unique_values
         candidates = self.rng.choice(
             unique_values,
-            size=self.config.max_xgboost_bins,
+            size=self.max_xgboost_bins,
             replace=False,
         )
         return np.sort(candidates)
 
-    def propose_candidates(self, feature, values, hessian, row_indices=None):
-        match self.xgboost_candidate_proposal:
-            case self.XGBoostCandidate.WEIGHTED_QUANTILE:
-                candidates = self.weighted_quantile_candidates(feature=feature, values=values, hessian=hessian, row_indices=row_indices)
-            case self.XGBoostCandidate.UNWEIGHTED_QUANTILE:
-                candidates = self.unweighted_quantile_candidates(values)
-            case self.XGBoostCandidate.RANDOM:
-                candidates = self.random_candidate_thresholds(values)
-            case _:
-                raise ValueError(
-                    f"Unsupported {self.XGBoostCandidate}, supported values are {list(self.XGBoostCandidate)}"
-                )
-        return candidates
-
-    def weighted_quantile_buckets(self, values, gradient, hessian, feature, row_indices):
-        candidates = self.propose_candidates(values=values, hessian=hessian, feature=feature, row_indices=row_indices)
+    def weighted_quantile_buckets(
+        self, values, gradient, hessian, feature, row_indices
+    ):
+        candidates = self.propose_candidates(
+            values=values, hessian=hessian, feature=feature, row_indices=row_indices
+        )
         bucket_G, bucket_H, bucket_count = self.bucket_stats_from_candidates(
             values,
             gradient,
@@ -1364,202 +1412,121 @@ class ANonSeriousDecisionTree:
         bucket_count = np.bincount(bucket_ids, minlength=len(candidates) + 1)
         return bucket_G, bucket_H, bucket_count
 
-    def _vectorized_split_search(self, X, y, feature):
-        if self.categorical:
-            raise RuntimeError("Categorical data can't be used for vectorized search")
-        samples = X[:, feature]
-        size = y.size
+    def catboost_ordered_target_statistics(self, X, y, feature):
+        number_of_rows = X.shape[0]
+        encoded = np.arange(0.0, size=number_of_rows)
 
-        unique_values = np.unique(samples)
-        thresholds = (unique_values[1:] + unique_values[:-1]) / 2
-        if thresholds.size == 0:
-            return (0.0, np.inf)
-        one_hot = np.eye(self.classes_.size, dtype=np.int32)[
-            np.searchsorted(self.classes_, y)
-        ]
+        count_by_category = {}
+        sum_by_category = {}
 
-        left_mask = samples[:, None] > thresholds[None, :]
-        left_counts = left_mask.T.astype(int) @ one_hot
-        total_counts = np.sum(one_hot, axis=0, keepdims=True)
-        right_counts = total_counts - left_counts
+        permutation_order = self.rng.permutation(number_of_rows)
 
-        left_total = np.sum(left_counts, axis=1)
-        right_total = size - left_total
+        self.global_prior = np.mean(y)
+        prior_weight = self.smoothing_strength
 
-        left_probability = left_counts / left_total[:, None]
-        right_probability = right_counts / right_total[:, None]
+        for row in permutation_order:
+            category = X[row, feature]
 
-        __left = None
-        __right = None
-        __weighted_average = None
-        match self.information_gain:
-            case self.InformationGain.GINI:
-                __left = 1.0 - np.sum(left_probability**2, axis=1)
-                __right = 1.0 - np.sum(right_probability**2, axis=1)
-            case self.InformationGain.ENTROPY:
-                __left = -np.sum(
-                    left_probability * np.log2(left_probability + self.config.epsilon),
-                    axis=1,
-                )
-                __right = -np.sum(
-                    right_probability
-                    * np.log2(right_probability + self.config.epsilon),
-                    axis=1,
-                )
-            case _:
-                raise ValueError(
-                    f"Unsupported {self.information_gain}, supported values are {list(self.InformationGain)}"
-                )
-        __weighted_average = self.weighted_impurity(
-            __left, __right, left_total, right_total
-        )
-        result = int(np.argmin(__weighted_average))
+            previous_count = count_by_category.get(category, 0)
+            previous_sum = sum_by_category.get(category, 0)
 
-        return float(thresholds[result]), float(__weighted_average[result])
+            encoded[row] = (previous_sum + prior_weight * self.global_prior) / (
+                previous_count + prior_weight
+            )
 
-    def random_split_criterion(self, features, X):
-        for _ in range(X.shape[1]):
-            random_feature = self.rng.choice(features, size=1, replace=False)[0]
+            count_by_category[category] = previous_count + 1
+            sum_by_category[category] = previous_sum + y[row]
+        return encoded, count_by_category, sum_by_category
 
-            values = X[:, random_feature]
+    def _catboost_fit_ordered_target_statistics(self, X, y):
+        X_encoded = copy.deepcopy(X)
+        for feature in X_encoded.shape[1]:
+            encoded_column, count_by_category, sum_by_category, prior = (
+                self.catboost_ordered_target_statistics(X, y, feature)
+            )
+            X[:, feature] = encoded_column
+            self.catboost_statistics[feature] = {
+                "count_by_category": count_by_category,
+                "sum_by_category": sum_by_category,
+                "prior": prior,
+            }
+        return X_encoded
 
-            min_value = min(values)
-            max_value = max(values)
+    def _transform_categories(self, X):
+        X_encoded = copy.deepcopy(X)
+        prior_weight = self.smoothing_strength
+        for feature in X_encoded.shape[1]:
+            for row in X_encoded[:, feature]:
+                category_value = X_encoded[row, feature]
+                if category_value in self.catboost_statistics:
+                    encoded_value = (
+                        self.catboost_statistics["sum_by_category"]
+                        + prior_weight * self.global_prior
+                    ) / (self.catboost_statistics["count_by_category"] + prior_weight)
+                X_encoded[row, feature] = encoded_value
+        return X_encoded
 
-            if min_value == max_value:
-                continue
-            threshold = self.rng.uniform(min_value, max_value)
-
-            left_mask = values > threshold
-            right_mask = values <= threshold
-
-            if len(values[left_mask]) == 0 or len(values[right_mask]) == 0:
-                continue
-            return random_feature, threshold
-
-    def random_feature_criterion(self, features, number_of_features):
-        max_feature_method = None
-        match self.max_features:
-            case self.MaxFeatures.SQRT:
-                max_feature_method = np.sqrt
-            case self.MaxFeatures.LOG2:
-                max_feature_method = lambda x: np.log2(x + self.config.epsilon)
-            case _:
-                raise ValueError(
-                    f"Unsupported {self.max_features}, supported values are {list(self.MaxFeatures)}"
-                )
-        ratio_size = self.max_features_ratio * number_of_features
-        # number_of_features = (
-        #     ratio_size
-        #     if ratio_size <= number_of_features
-        #     else number_of_features
-        # )
-        number_of_features = (
-            number_of_features
-            if number_of_features <= self.max_number_of_features
-            else self.max_number_of_features
-        )
-
-        candidate_count = max(1, int(max_feature_method(number_of_features)))
-        _features = self.rng.choice(features, size=candidate_count, replace=False)
-        return _features
-
-    def mse(self, y, y_hat):
-        return np.mean((y - y_hat) ** 2)
-
-    def mse_mean(self, y):
-        return np.mean((y - np.mean(y)) ** 2)
-
-    def sse(self, y, y_hat):
-        return np.sum((y - y_hat) ** 2)
-
-    def rmse(self, y, y_hat):
-        return np.sqrt(self.mse(y, y_hat))
-
-    def r2(self, y, y_hat):
-        ss_res = np.sum((y - y_hat) ** 2)
-        ss_total = np.sum((y - np.mean(y)) ** 2)
-        if ss_total == 0:
-            return 0
-        return 1 - ss_res / ss_total
-
-    def weighted_mse(self, left_y, right_y):
-        total = len(left_y) + len(right_y)
-        return len(left_y) / total * self.mse_mean(left_y) + len(
-            right_y
-        ) / total * self.mse_mean(right_y)
-
-    def gini(self, y):
-        if len(y) == 0:
-            return 0
-        _, counts = np.unique(y, return_counts=True)
-        proportions = counts / len(y)
-        return 1 - np.sum(proportions**2)
-
-    def entropy(self, y):
-        if len(y) == 0:
-            return 0
-        _, counts = np.unique(y, return_counts=True)
-        proportions = counts / len(y)
-        return -np.sum(proportions * np.log2(proportions + self.config.epsilon))
-
-    def weighted_impurity(self, left, right, left_size, right_size):
-        total_size = left_size + right_size
-        return (left_size / total_size) * left + (right_size / total_size) * right
-
-    def calculate_error(self, node):
+    def predict_one(self, x, node=None, verbose=False, leaf_node=False):
         if node is None:
-            return
+            node = self.root
 
-        if node.is_leaf or node.value is not None:
-            node.number_of_leaves = 1
-            node.subtree_error = node.leaf_error
-            return
+        if node.value is not None:
+            if leaf_node:
+                return node
+            return node.value
 
-        self.calculate_error(node.left)
-        self.calculate_error(node.right)
+        if self._is_missing_scalar(x[node.feature]):
+            if (
+                node.default_missing_value_direction
+                is self.DefaultMissingValueDirection.LEFT
+            ):
+                return self.predict_one(x, node.left, leaf_node=leaf_node)
+            else:
+                return self.predict_one(x, node.right, leaf_node=leaf_node)
+        if self.categorical:
+            if x[node.feature] == node.threshold:
+                return self.predict_one(x, node.left, leaf_node=leaf_node)
+            else:
+                return self.predict_one(x, node.right, leaf_node=leaf_node)
+        else:
+            if x[node.feature] > node.threshold:
+                return self.predict_one(x, node.left, leaf_node=leaf_node)
+            else:
+                return self.predict_one(x, node.right, leaf_node=leaf_node)
 
-        node.number_of_leaves = node.left.number_of_leaves + node.right.number_of_leaves
-        node.subtree_error = node.left.subtree_error + node.right.subtree_error
+    def predict(self, X):
+        if self.catboost:
+            X = self._transform_categories(X)
+        if self.vectorized:
+            return self.vectorized_predict_search(X)
+        return np.array([self.predict_one(x) for x in X])
 
-    def weakest_node(self, node):
-        if (
-            node is None
-            or node.is_leaf
-            or node.value is not None
-            or node.number_of_leaves <= 1
-        ):
-            return None, float("inf")
+    def vectorized_predict_search(self, X):
+        self._update_bounds()
+        leaves = self.get_leaves()
+        for leaf in leaves:
+            leaf.update_indicator()
+        values = np.array([leaf.value for leaf in leaves], dtype=float)
+        indicators = np.array([leaf.indicator(X) for leaf in leaves], dtype=float)
+        if not np.all(np.sum(indicators, axis=0) == 1):
+            raise RuntimeError("All column sums in the matrix must be equal to 1")
+        return values @ indicators
 
-        alpha = (node.leaf_error - node.subtree_error) / (node.number_of_leaves - 1)
+    def predict_probability(self, X):
+        return np.array([self.predict_probability_one(x) for x in X])
 
-        left_node, left_alpha = self.weakest_node(node.left)
-        right_node, right_alpha = self.weakest_node(node.right)
-
-        weakest = node
-        weakest_alpha = alpha
-
-        if left_alpha < weakest_alpha:
-            weakest = left_node
-            weakest_alpha = left_alpha
-        if right_alpha < weakest_alpha:
-            weakest = right_node
-            weakest_alpha = right_alpha
-
-        return weakest, weakest_alpha
+    def predict_probability_one(self, X):
+        leaf = self.predict_one(X, leaf_node=True)
+        return leaf.number_of_classes / leaf.number_of_samples
 
     def prune_reduced_error(self, node, X_val, y_val):
         if node is None:
             return
         if node.value is not None:
             return
-
-        if self.categorical:
-            left_mask = X_val[:, node.feature] == node.threshold
-            right_mask = X_val[:, node.feature] != node.threshold
-        else:
-            left_mask = X_val[:, node.feature] > node.threshold
-            right_mask = X_val[:, node.feature] <= node.threshold
+        left_mask, right_mask = self._route_node_data(
+            X_val[:, node.feature], node.threshold
+        )
 
         self._prune_node(node.left, X_val[left_mask], y_val[left_mask])
         self._prune_node(node.right, X_val[right_mask], y_val[right_mask])
@@ -1688,15 +1655,6 @@ class ANonSeriousDecisionTree:
         else:
             pass
 
-    def _route_node_data(self, node, X, y):
-        if self.categorical:
-            left_mask = X[:, node.feature] == node.threshold
-            right_mask = X[:, node.feature] != node.threshold
-        else:
-            left_mask = X[:, node.feature] > node.threshold
-            right_mask = X[:, node.feature] <= node.threshold
-        return X[left_mask], y[left_mask], X[right_mask], y[right_mask]
-
     def _count_errors(self, node, X, y):
         predictions = np.array([self.predict_one(x, node) for x in X])
         return np.sum(predictions != y)
@@ -1705,32 +1663,6 @@ class ANonSeriousDecisionTree:
         majority = self._majority_class(y)
         errors = np.sum(y != majority)
         return majority, errors
-
-    def ucf(self, errors, total, confidence_factor=0.25):
-        if total == 0:
-            return 0.0
-        if errors == 0:
-            return 1.0 - confidence_factor ** (1.0 / total)
-        if errors == total:
-            return 1.0
-
-        low = errors / total
-        high = 1.0
-
-        while high - low > self.config.epsilon:
-            mid = (low + high) / 2
-            probability = self.binomial_cdf(errors, total, mid)
-            if probability > confidence_factor:
-                low = mid
-            else:
-                high = mid
-        return high
-
-    def binomial_cdf(self, errors, total, p):
-        return sum(
-            math.comb(total, i) * (p**i) * ((1 - p) ** (total - i))
-            for i in range(errors + 1)
-        )
 
     def prune_minimum_error(self):
         self._prune_minimum_error(self.root)
@@ -1786,83 +1718,261 @@ class ANonSeriousDecisionTree:
                 )
         return error_estimate
 
-    def _class_counts(self, y):
-        counts = np.zeros(len(self.classes_))
-        for i, cls in enumerate(self.classes_):
-            counts[i] = np.sum(y == cls)
-        return counts
-
-    def _prune_node(self, node):
-        node.is_leaf = True
-        node.number_of_leaves = 1
-        node.subtree_error = node.leaf_error
-        node.left = None
-        node.right = None
-        node.feature = None
-        node.threshold = None
-        node.value = node.majority_class
-
-    def predict_one(self, x, node=None, verbose=False, leaf_node=False):
+    def calculate_error(self, node):
         if node is None:
-            node = self.root
+            return
 
-        if node.value is not None:
-            if leaf_node:
-                return node
-            return node.value
-        
-        if self._is_missing_scalar(x[node.feature]):
-            if node.default_missing_value_direction is self.DefaultMissingValueDirection.LEFT:
-                return self.predict_one(x, node.left, leaf_node=leaf_node)
-            else:
-                return self.predict_one(x, node.right, leaf_node=leaf_node)
-        if self.categorical:
-            if x[node.feature] == node.threshold:
-                return self.predict_one(x, node.left, leaf_node=leaf_node)
-            else:
-                return self.predict_one(x, node.right, leaf_node=leaf_node)
-        else:
-            if x[node.feature] > node.threshold:
-                return self.predict_one(x, node.left, leaf_node=leaf_node)
-            else:
-                return self.predict_one(x, node.right, leaf_node=leaf_node)
+        if node.is_leaf or node.value is not None:
+            node.number_of_leaves = 1
+            node.subtree_error = node.leaf_error
+            return
 
-    def _is_missing_scalar(self, value):
+        self.calculate_error(node.left)
+        self.calculate_error(node.right)
+
+        node.number_of_leaves = node.left.number_of_leaves + node.right.number_of_leaves
+        node.subtree_error = node.left.subtree_error + node.right.subtree_error
+
+    def weakest_node(self, node):
+        if (
+            node is None
+            or node.is_leaf
+            or node.value is not None
+            or node.number_of_leaves <= 1
+        ):
+            return None, float("inf")
+
+        alpha = (node.leaf_error - node.subtree_error) / (node.number_of_leaves - 1)
+
+        left_node, left_alpha = self.weakest_node(node.left)
+        right_node, right_alpha = self.weakest_node(node.right)
+
+        weakest = node
+        weakest_alpha = alpha
+
+        if left_alpha < weakest_alpha:
+            weakest = left_node
+            weakest_alpha = left_alpha
+        if right_alpha < weakest_alpha:
+            weakest = right_node
+            weakest_alpha = right_alpha
+
+        return weakest, weakest_alpha
+
+    def random_split_criterion(self, features, X):
+        for _ in range(X.shape[1]):
+            random_feature = self.rng.choice(features, size=1, replace=False)[0]
+
+            values = X[:, random_feature]
+
+            min_value = min(values)
+            max_value = max(values)
+
+            if min_value == max_value:
+                continue
+            threshold = self.rng.uniform(min_value, max_value)
+
+            left_mask = values > threshold
+            right_mask = values <= threshold
+
+            if len(values[left_mask]) == 0 or len(values[right_mask]) == 0:
+                continue
+            return random_feature, threshold
+
+    def random_feature_criterion(self, features, number_of_features):
+        max_feature_method = None
+        match self.max_features:
+            case self.MaxFeatures.SQRT:
+                max_feature_method = np.sqrt
+            case self.MaxFeatures.LOG2:
+                max_feature_method = lambda x: np.log2(x + self.config.epsilon)
+            case _:
+                raise ValueError(
+                    f"Unsupported {self.max_features}, supported values are {list(self.MaxFeatures)}"
+                )
+        ratio_size = self.max_features_ratio * number_of_features
+        # number_of_features = (
+        #     ratio_size
+        #     if ratio_size <= number_of_features
+        #     else number_of_features
+        # )
+        number_of_features = (
+            number_of_features
+            if number_of_features <= self.max_number_of_features
+            else self.max_number_of_features
+        )
+
+        candidate_count = max(1, int(max_feature_method(number_of_features)))
+        _features = self.rng.choice(features, size=candidate_count, replace=False)
+        return _features
+
+    def purpose_missing_values(
+        self,
+        X,
+        gradient,
+        hessian,
+        G_parent,
+        H_parent,
+        best_feature=None,
+        best_threshold=None,
+        best_gain=float("-inf"),
+    ):
+        default_missing_value_direction = None
+
+        number_of_features = X.shape[1]
+        features = np.arange(number_of_features)
+
+        for feature in features:
+            values = X[:, feature]
+            missing_mask = self._missing_mask(values)
+            observed_values = values[~missing_mask]
+
+            order = np.argsort(observed_values)
+            observed_indices = np.where(~missing_mask)[0]
+            sorted_observed_indices = observed_indices[order]
+            sorted_values = values[sorted_observed_indices]
+
+            value_range = len(sorted_values) - 1
+            sorted_gradient = gradient[sorted_observed_indices]
+            sorted_hessian = hessian[sorted_observed_indices]
+
+            best_gain_right, best_threshold_right = self._missing_values_default_right(
+                sorted_values=sorted_values,
+                value_range=value_range,
+                sorted_gradient=sorted_gradient,
+                sorted_hessian=sorted_hessian,
+                G_parent=G_parent,
+                H_parent=H_parent,
+                best_gain=best_gain,
+                best_threshold=best_threshold,
+            )
+            best_gain_left, best_threshold_left = self._missing_values_default_left(
+                sorted_values=sorted_values,
+                value_range=value_range,
+                sorted_gradient=sorted_gradient,
+                sorted_hessian=sorted_hessian,
+                G_parent=G_parent,
+                H_parent=H_parent,
+                best_gain=best_gain,
+                best_threshold=best_threshold,
+            )
+
+            if best_gain_right is not None and best_gain_right > best_gain:
+                best_feature = feature
+                best_gain = best_gain_right
+                best_threshold = best_threshold_right
+                default_missing_value_direction = (
+                    self.DefaultMissingValueDirection.RIGHT
+                )
+            if best_gain_left is not None and best_gain_left > best_gain:
+                best_feature = feature
+                best_gain = best_gain_left
+                best_threshold = best_threshold_left
+                default_missing_value_direction = self.DefaultMissingValueDirection.LEFT
+        return best_feature, best_threshold, default_missing_value_direction
+
+    def _missing_mask(self, values):
         if self.missing_value is None:
-            return np.isnan(value)
+            return np.isnan(values)
         if isinstance(self.missing_value, float) and np.isnan(self.missing_value):
-            return np.isnan(value)
-        return value == self.missing_value
+            return np.isnan(values)
+        return values == self.missing_value
 
-    def predict(self, X):
-        if self.vectorized:
-            return self.vectorized_predict_search(X)
-        return np.array([self.predict_one(x) for x in X])
+    def _missing_values_default_left(
+        self,
+        sorted_values,
+        value_range,
+        sorted_gradient,
+        sorted_hessian,
+        G_parent,
+        H_parent,
+        best_threshold=None,
+        best_gain=float("-inf"),
+    ):
+        G_right = 0.0
+        H_right = 0.0
 
-    def vectorized_predict_search(self, X):
-        self._update_bounds()
-        leaves = self.get_leaves()
-        for leaf in leaves:
-            leaf.update_indicator()
-        values = np.array([leaf.value for leaf in leaves], dtype=float)
-        indicators = np.array([leaf.indicator(X) for leaf in leaves], dtype=float)
-        if not np.all(np.sum(indicators, axis=0) == 1):
-            raise RuntimeError("All column sums in the matrix must be equal to 1")
-        return values @ indicators
+        for boundary in range(value_range):
+            G_right += sorted_gradient[boundary]
+            H_right += sorted_hessian[boundary]
 
-    def _update_bounds(self):
-        self.root.update_bounds_below()
+            if sorted_values[boundary] == sorted_values[boundary + 1]:
+                continue
+            right_count = boundary + 1
+            left_count = len(sorted_values) - right_count
 
-    def predict_probability(self, X):
-        return np.array([self.predict_probability_one(x) for x in X])
+            if (
+                left_count < self.minimum_split_size
+                or right_count < self.minimum_split_size
+            ):
+                continue
+            G_left = G_parent - G_right
+            H_left = H_parent - H_right
 
-    def predict_probability_one(self, X):
-        leaf = self.predict_one(X, leaf_node=True)
-        return leaf.number_of_classes / leaf.number_of_samples
+            gain = self._xgboost_gain(
+                G_parent=G_parent,
+                G_left=G_left,
+                G_right=G_right,
+                H_parent=H_parent,
+                H_left=H_left,
+                H_right=H_right,
+            )
+            if gain > best_gain:
+                best_gain = gain
+                best_threshold = (
+                    sorted_values[boundary] + sorted_values[boundary + 1]
+                ) / 2
+        if best_gain <= 0:
+            return None, None
+        return best_gain, best_threshold
 
-    def _majority_class(self, y):
-        values, counts = np.unique(y, return_counts=True)
-        return values[np.argmax(counts)]
+    def _missing_values_default_right(
+        self,
+        sorted_values,
+        value_range,
+        sorted_gradient,
+        sorted_hessian,
+        G_parent,
+        H_parent,
+        best_threshold=None,
+        best_gain=float("-inf"),
+    ):
+        G_left = 0.0
+        H_left = 0.0
+
+        for boundary in range(value_range):
+            G_left += sorted_gradient[boundary]
+            H_left += sorted_hessian[boundary]
+
+            if sorted_values[boundary] == sorted_values[boundary + 1]:
+                continue
+            left_count = boundary + 1
+            right_count = len(sorted_values) - left_count
+
+            if (
+                right_count < self.minimum_split_size
+                or left_count < self.minimum_split_size
+            ):
+                continue
+            G_right = G_parent - G_left
+            H_right = H_parent - H_left
+
+            gain = self._xgboost_gain(
+                G_parent=G_parent,
+                G_left=G_left,
+                G_right=G_right,
+                H_parent=H_parent,
+                H_left=H_left,
+                H_right=H_right,
+            )
+            if gain > best_gain:
+                best_gain = gain
+                best_threshold = (
+                    sorted_values[boundary] + sorted_values[boundary + 1]
+                ) / 2
+        if best_gain <= 0:
+            return None, None
+        return best_gain, best_threshold
 
     def evaluate_dataset(self, X, y):
         if y.ndim == 2:
@@ -1884,8 +1994,26 @@ class ANonSeriousDecisionTree:
                     )
         return predictions, accuracy
 
+    def feature_importance(self):
+        print("\nFeature Importances :")
+        total = sum(self.feature_importances.values())
+        for key, value in self.feature_importances.items():
+            print(f"For feature{key}, importance is {(value/total) * 100}%")
+
+        features = self.feature_importances.keys()
+        values = [(v / total) * 100 for v in self.feature_importances.values()]
+        plt.figure("Feature Importances")
+        plt.xlabel("Features")
+        plt.ylabel("Values")
+        plt.barh(features, values)
+
+        os.makedirs("img", exist_ok=True)
+
+        plt.savefig("img/ftr_mprtncs.png")
+        plt.show()
+
     def permutation_importance(
-        self, X, y, feature_names=None, n_repeats=50, seed=42, verbose=False
+        self, X, y, feature_names=None, n_repeats=50, verbose=False
     ):
         _, baseline_accuracy = self.evaluate_dataset(X, y)
         rng = self.rng
@@ -2066,7 +2194,7 @@ class ANonSeriousDecisionTree:
         return text
 
     @classmethod
-    def generate_config(cls, max_depth, max_gain=None):
+    def generate_config(cls, max_depth):
         configs = []
         for max_depth in [i for i in range(max_depth + 1)]:
             for minimum_gain in [0.0, 0.001, 0.01, 0.05]:
@@ -2190,13 +2318,14 @@ class ANonSeriousDecisionTree:
         final_tree.fit(X_train_val, y_train_val, verbose=verbose)
         return final_tree
 
+
 if __name__ == "__main__":
     from boosting.generate_categories import create_categorical_dataset
 
     X, y = create_categorical_dataset(n_samples=300, seed=42)
     X = np.asarray(X)
     y = np.asarray(y)
-    
+
     tree = ANonSeriousDecisionTree(
         max_depth=10,
         minimum_population_size=2,
@@ -2206,8 +2335,7 @@ if __name__ == "__main__":
         information_gain=ANonSeriousDecisionTree.InformationGain.GINI,
         tree_type=ANonSeriousDecisionTree.TreeType.CLASSIFICATION,
     )
-    
+
     tree.fit(X, y, verbose=True)
-    
+
     tree.visualize_tree(2, 3)
-    

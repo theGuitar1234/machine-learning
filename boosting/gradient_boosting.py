@@ -35,6 +35,8 @@ class GradientBoosting:
     ):
         if not (0 < sub_sample <= 1) and not (0 < column_sub_sample <= 1):
             raise ValueError("sub_sample and column_sub_sample must be a positive fraction less than 1")
+        if restore_best and not validation:
+            raise ValueError("restore_best=True requires validation=True")
         self.sub_sample = sub_sample
         self.column_sub_sample = column_sub_sample
         self.boosting_rounds = boosting_rounds
@@ -120,7 +122,7 @@ class GradientBoosting:
                 if self.early_stopping and patience_counter >= patience:
                     print("Overfitting detected. Early stopping at round: ", round, "Best Round : ", best_round)
                     break
-        if self.restore_best:
+        if self.restore_best and self.validation:
             self.trees = self.trees[:best_number_of_trees]
             self.feature_indices = self.feature_indices[:best_number_of_trees]
             self.F_x = np.repeat(self.F_0x, X.shape[0])

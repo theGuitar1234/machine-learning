@@ -25,6 +25,7 @@ class XGBoost:
         validation_tolerance: float = 10
         patience: int = 100
         batch_size: int = 50
+        max_xgboost_bins: int = 50
 
     def __init__(
         self,
@@ -154,6 +155,7 @@ class XGBoost:
             tree.l2 = self.config.l2
             tree.gamma = self.config.gamma
             tree.batch_size = self.config.batch_size
+            tree.max_xgboost_bins = self.max_xgboost_bins
 
             pseudo_residual = -self.dloss(y, self.F_x)
             match self.loss_type:

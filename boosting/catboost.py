@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from enum import Enum
 
 from sklearn import datasets
@@ -13,6 +14,10 @@ class CatBoost:
     class LossType(Enum):
         BINARY_CROSS_ENTROPY = 1
         SSE = 2
+    
+    @dataclass
+    class TrainDefaults:
+        smoothing_strength: int = 10
 
     def __init__(
         self,
@@ -21,20 +26,23 @@ class CatBoost:
         max_depth=10,
         minimum_population_size=2,
         minimum_gain=0.001,
-        categorical=True,
+        categorical=False,
         adjacent=False,
         information_gain=ANonSeriousDecisionTree.InformationGain.GINI,
         random_criterion=None,
-        tree_type=ANonSeriousDecisionTree.TreeType.CLASSIFICATION,
+        tree_type=ANonSeriousDecisionTree.TreeType.REGRESSION,
         loss_type=None,
         sub_sample=0.8,
         column_sub_sample=1,
         early_stopping=False,
         restore_best=False,
         validation=False,
+        config=TrainDefaults(),
     ):
         if not (0 < sub_sample <= 1) and not (0 < column_sub_sample <= 1):
             raise ValueError("sub_sample and column_sub_sample must be a positive fraction less than 1")
+        if restore_best and not validation:
+            raise ValueError("restore_best=True requires validation=True")
         self.sub_sample = sub_sample
         self.column_sub_sample = column_sub_sample
         self.boosting_rounds = boosting_rounds
@@ -51,6 +59,7 @@ class CatBoost:
         self.early_stopping = early_stopping
         self.restore_best = restore_best
         self.validation = validation
+        self.config = config
 
     def fit(self, X, y, X_val, y_val, epsilon=1e-12):
         self.X_train_ = X
@@ -94,6 +103,8 @@ class CatBoost:
                 tree_type=self.tree_type,
             )
             
+            tree.smoothing_strength = self.config.smoothing_strength
+            
             indices = np.random.choice(number_of_samples, size=sample_size, replace=False)
             feature_indices = np.random.choice(number_of_features, size=number_of_selected_features, replace=False)
             
@@ -120,7 +131,7 @@ class CatBoost:
                 if self.early_stopping and patience_counter >= patience:
                     print("Overfitting detected. Early stopping at round: ", round, "Best Round : ", best_round)
                     break
-        if self.restore_best:
+        if self.restore_best and self.validation:
             self.trees = self.trees[:best_number_of_trees]
             self.feature_indices = self.feature_indices[:best_number_of_trees]
             self.F_x = np.repeat(self.F_0x, X.shape[0])
@@ -210,6 +221,223 @@ class CatBoost:
         for tree, feature_indices in zip(self.trees, self.feature_indices):
             prediction += self.learning_rate * tree.predict(X[:, feature_indices])
         return prediction
+    
+    def visualize(self):
+        if self.X_train_ is None or self.y_train_ is None:
+            raise RuntimeError("Model is not fit")
+
+        os.makedirs("boosting/img", exist_ok=True)
+
+        X = np.asarray(self.X_train_)
+        y = np.asarray(self.y_train_).ravel()
+
+        y_pred = self.predict(X).ravel()
+
+        plt.figure(figsize=(7, 5))
+        plt.scatter(y, y_pred, alpha=0.7)
+
+        min_val = min(y.min(), y_pred.min())
+        max_val = max(y.max(), y_pred.max())
+
+        plt.plot([min_val, max_val], [min_val, max_val], linestyle="--")
+
+        plt.xlabel("Actual y")
+        plt.ylabel("Predicted y")
+        plt.title("Actual vs Predicted")
+        plt.grid(True)
+        plt.savefig("boosting/img/actual_vs_predicted.png")
+        plt.show()
+
+        residuals = y - y_pred
+
+        plt.figure(figsize=(7, 5))
+        plt.scatter(y_pred, residuals, alpha=0.7)
+        plt.axhline(0, linestyle="--")
+
+        plt.xlabel("Predicted y")
+        plt.ylabel("Residual: y - prediction")
+        plt.title("Residual Plot")
+        plt.grid(True)
+        plt.savefig("boosting/img/residual_plot.png")
+        plt.show()
+
+        plt.figure(figsize=(7, 5))
+        plt.hist(y_pred, bins=30, alpha=0.7)
+
+        plt.xlabel("Prediction")
+        plt.ylabel("Frequency")
+        plt.title("Prediction Distribution")
+        plt.grid(True)
+        plt.savefig("boosting/img/prediction_distribution.png")
+        plt.show()
+
+        losses = []
+
+        current_pred = np.repeat(self.F_0x, X.shape[0])
+        initial_mse = np.mean((y - current_pred) ** 2)
+        losses.append(initial_mse)
+
+        for tree, feature_indices in zip(self.trees, self.feature_indices):
+            current_pred += self.learning_rate * tree.predict(X[:, feature_indices])
+            mse = np.mean((y - current_pred) ** 2)
+            losses.append(mse)
+
+        plt.figure(figsize=(7, 5))
+        plt.plot(losses)
+
+        plt.xlabel("Boosting Round")
+        plt.ylabel("Training MSE")
+        plt.title("Training Loss Over Boosting Rounds")
+        plt.grid(True)
+        plt.savefig("boosting/img/training_loss.png")
+        plt.show()
+
+        sample_count = min(10, X.shape[0])
+
+        prediction_history = []
+
+        current_pred = np.repeat(self.F_0x, X.shape[0])
+        prediction_history.append(current_pred[:sample_count].copy())
+
+        for tree, feature_indices in zip(self.trees, self.feature_indices):
+            current_pred += self.learning_rate * tree.predict(X[:, feature_indices])
+            prediction_history.append(current_pred[:sample_count].copy())
+
+        prediction_history = np.asarray(prediction_history)
+
+        plt.figure(figsize=(8, 5))
+
+        for sample_index in range(sample_count):
+            plt.plot(prediction_history[:, sample_index], alpha=0.7)
+
+        plt.xlabel("Boosting Round")
+        plt.ylabel("Prediction")
+        plt.title("Prediction Movement During Boosting")
+        plt.grid(True)
+        plt.savefig("boosting/img/prediction_movement.png")
+        plt.show()
+
+        feature_usage = np.zeros(X.shape[1])
+
+        for feature_indices in self.feature_indices:
+            for feature_index in feature_indices:
+                feature_usage[feature_index] += 1
+
+        plt.figure(figsize=(8, 5))
+        plt.bar(np.arange(X.shape[1]), feature_usage)
+
+        plt.xlabel("Feature")
+        plt.ylabel("Times Used")
+        plt.title("Feature Usage Across Trees")
+        plt.grid(True)
+        plt.savefig("boosting/img/feature_usage.png")
+        plt.show()
+
+        for feature in range(X.shape[1]):
+            values = X[:, feature]
+            unique_values = np.unique(values)
+
+            plt.figure(figsize=(8, 5))
+
+            if len(unique_values) <= 25:
+                mean_actual = []
+                mean_prediction = []
+
+                for value in unique_values:
+                    mask = values == value
+                    mean_actual.append(np.mean(y[mask]))
+                    mean_prediction.append(np.mean(y_pred[mask]))
+
+                positions = np.arange(len(unique_values))
+
+                plt.plot(positions, mean_actual, marker="o", label="Mean actual")
+                plt.plot(positions, mean_prediction, marker="o", label="Mean prediction")
+
+                plt.xticks(positions, unique_values, rotation=45)
+
+                plt.xlabel(f"Feature {feature}")
+                plt.ylabel("Mean value")
+                plt.title(f"Feature {feature} Response")
+                plt.legend()
+                plt.grid(True)
+
+            else:
+                plt.scatter(values, y, alpha=0.4, label="Actual")
+                plt.scatter(values, y_pred, alpha=0.4, label="Predicted")
+
+                plt.xlabel(f"Feature {feature}")
+                plt.ylabel("Target / Prediction")
+                plt.title(f"Feature {feature} Response")
+                plt.legend()
+                plt.grid(True)
+
+            plt.savefig(f"boosting/img/feature_{feature}_response.png")
+            plt.show()
+
+        if X.shape[1] < 2:
+            return
+
+        x1_values = np.unique(X[:, 0])
+        x2_values = np.unique(X[:, 1])
+
+        use_discrete_grid = len(x1_values) <= 30 and len(x2_values) <= 30
+
+        if use_discrete_grid:
+            xx1, xx2 = np.meshgrid(x1_values, x2_values)
+        else:
+            x1_min, x1_max = X[:, 0].min(), X[:, 0].max()
+            x2_min, x2_max = X[:, 1].min(), X[:, 1].max()
+
+            x1_grid = np.linspace(x1_min, x1_max, 100)
+            x2_grid = np.linspace(x2_min, x2_max, 100)
+
+            xx1, xx2 = np.meshgrid(x1_grid, x2_grid)
+
+        if X.shape[1] == 2:
+            grid_points = np.c_[xx1.ravel(), xx2.ravel()]
+        else:
+            average_point = np.mean(X, axis=0)
+            grid_points = np.tile(average_point, (xx1.ravel().shape[0], 1))
+
+            grid_points[:, 0] = xx1.ravel()
+            grid_points[:, 1] = xx2.ravel()
+
+        grid_predictions = self.predict(grid_points)
+        zz = grid_predictions.reshape(xx1.shape)
+
+        if use_discrete_grid:
+            plt.figure(figsize=(8, 6))
+            plt.imshow(zz, origin="lower", aspect="auto")
+            plt.colorbar(label="Predicted y")
+
+            plt.xticks(np.arange(len(x1_values)), x1_values)
+            plt.yticks(np.arange(len(x2_values)), x2_values)
+
+            x_positions = np.searchsorted(x1_values, X[:, 0])
+            y_positions = np.searchsorted(x2_values, X[:, 1])
+
+            plt.scatter(x_positions, y_positions, alpha=0.7)
+
+            plt.xlabel("Feature 1")
+            plt.ylabel("Feature 2")
+            plt.title("Discrete Prediction Heatmap")
+            plt.grid(False)
+            plt.savefig("boosting/img/discrete_prediction_heatmap.png")
+            plt.show()
+
+        else:
+            plt.figure(figsize=(8, 6))
+            contour = plt.contourf(xx1, xx2, zz, levels=30)
+            plt.colorbar(contour, label="Predicted y")
+
+            plt.scatter(X[:, 0], X[:, 1], alpha=0.7)
+
+            plt.xlabel("Feature 1")
+            plt.ylabel("Feature 2")
+            plt.title("Prediction Surface")
+            plt.grid(True)
+            plt.savefig("boosting/img/prediction_surface.png")
+            plt.show()
 
 
 if __name__ == "__main__":
@@ -222,7 +450,8 @@ if __name__ == "__main__":
 
     catboost = CatBoost(
         loss_type=CatBoost.LossType.SSE,
-        restore_best=True,
+        restore_best=False,
+        validation=False,
         early_stopping=False,
         sub_sample=1,
         column_sub_sample=1,
