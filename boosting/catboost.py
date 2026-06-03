@@ -4,9 +4,12 @@ from enum import Enum
 from sklearn import datasets
 import numpy as np
 from sklearn.model_selection import train_test_split
-from trees import ANonSeriousDecisionTree
+
 import matplotlib.pyplot as plt
 import os
+
+from trees import ANonSeriousDecisionTree
+from trees import ANonSeriousSymmetricalTree
 
 
 class CatBoost:
@@ -15,31 +18,41 @@ class CatBoost:
         BINARY_CROSS_ENTROPY = 1
         SSE = 2
     
+    class BoostingType:
+        PLAIN = 1
+        ORDERED = 2
+    
     @dataclass
     class TrainDefaults:
+        epsilon=1e-12
         smoothing_strength: int = 10
+        ordered_boosting_blocks: int = 10
 
     def __init__(
         self,
+        seed=42,
         boosting_rounds=100,
         learning_rate=0.03,
         max_depth=10,
         minimum_population_size=2,
         minimum_gain=0.001,
-        categorical=False,
         adjacent=False,
-        information_gain=ANonSeriousDecisionTree.InformationGain.GINI,
         random_criterion=None,
-        tree_type=ANonSeriousDecisionTree.TreeType.REGRESSION,
         loss_type=None,
         sub_sample=0.8,
         column_sub_sample=1,
         early_stopping=False,
         restore_best=False,
         validation=False,
+        symmetrical=False,
+        tree_type=ANonSeriousDecisionTree.TreeType.REGRESSION,
+        information_gain=ANonSeriousDecisionTree.InformationGain.GINI,
+        boosting_type=BoostingType.PLAIN,
+        encoding_target=None,
+        categorical_features=None,
         config=TrainDefaults(),
     ):
-        if not (0 < sub_sample <= 1) and not (0 < column_sub_sample <= 1):
+        if not (0 < sub_sample <= 1) or not (0 < column_sub_sample <= 1):
             raise ValueError("sub_sample and column_sub_sample must be a positive fraction less than 1")
         if restore_best and not validation:
             raise ValueError("restore_best=True requires validation=True")
@@ -50,7 +63,6 @@ class CatBoost:
         self.max_depth = max_depth
         self.minimum_population_size = minimum_population_size
         self.minimum_gain = minimum_gain
-        self.categorical = categorical
         self.adjacent = adjacent
         self.information_gain = information_gain
         self.random_criterion = random_criterion
@@ -59,15 +71,28 @@ class CatBoost:
         self.early_stopping = early_stopping
         self.restore_best = restore_best
         self.validation = validation
+        self.categorical_features = categorical_features or []
+        self.encoding_target = encoding_target
+        self.boosting_type = boosting_type
+        self.symmetrical = symmetrical
+        self.rng = np.random.default_rng(seed=seed)
         self.config = config
+        self.F_x = None
+        self.F_0x = None
 
-    def fit(self, X, y, X_val, y_val, epsilon=1e-12):
+    def fit(self, X, y, X_val, y_val):
         self.X_train_ = X
         self.y_train_ = y
         
         self.trees = []
         self.feature_indices = []
+        
+        number_of_samples = X.shape[0]
+        number_of_features = X.shape[1]
+        sample_size = max(1, int(self.sub_sample * number_of_samples))
+        number_of_selected_features = max(1, int(self.column_sub_sample * number_of_features))
 
+        epsilon = self.config.epsilon
         match self.loss_type:
             case self.LossType.BINARY_CROSS_ENTROPY:
                 p0 = np.clip(np.mean(y), epsilon, 1 - epsilon)
@@ -76,13 +101,7 @@ class CatBoost:
                 self.F_0x = np.mean(y)
             case _:
                 raise ValueError(f"Unsupported {self.LossType}, supported values are {list(self.LossType)}")
-
         self.F_x = np.repeat(self.F_0x, y.shape[0])
-        
-        number_of_samples = X.shape[0]
-        number_of_features = X.shape[1]
-        sample_size = max(1, int(self.sub_sample * number_of_samples))
-        number_of_selected_features = max(1, int(self.column_sub_sample * number_of_features))
 
         best_val_loss = float("inf")
         patience = 100
@@ -92,17 +111,24 @@ class CatBoost:
         for round in range(self.boosting_rounds):
             pseudo_residual = -self.dloss(y, self.F_x)
 
-            tree = ANonSeriousDecisionTree(
-                max_depth=self.max_depth,
-                minimum_population_size=self.minimum_population_size,
-                minimum_gain=self.minimum_gain,
-                categorical=self.categorical,
-                adjacent=self.adjacent,
-                information_gain=self.information_gain,
-                random_criterion=self.random_criterion,
-                tree_type=self.tree_type,
-            )
-            
+            if self.symmetrical:
+                tree = ANonSeriousSymmetricalTree(
+                    max_depth=self.max_depth,
+                    minimum_split_size=self.minimum_population_size,
+                    minimum_gain=self.minimum_gain
+                )
+            else:
+                tree = ANonSeriousDecisionTree(
+                    max_depth=self.max_depth,
+                    minimum_population_size=self.minimum_population_size,
+                    minimum_gain=self.minimum_gain,
+                    categorical=False,
+                    adjacent=self.adjacent,
+                    information_gain=self.information_gain,
+                    random_criterion=self.random_criterion,
+                    tree_type=self.tree_type,
+                    catboost=True,
+                )
             tree.smoothing_strength = self.config.smoothing_strength
             
             indices = np.random.choice(number_of_samples, size=sample_size, replace=False)
@@ -110,10 +136,36 @@ class CatBoost:
             
             X_sub = X[indices][:, feature_indices]
             pseudo_residual_sub = pseudo_residual[indices]
+            y_sub_original = y[indices]
             
-            tree.fit(X_sub, pseudo_residual_sub)
+            # if self.categorical_features is not None:
+            #     local_categorical_features = []
+            #     for local_position, original_feature in enumerate(feature_indices):
+            #         if original_feature in self.categorical_features:
+            #             local_categorical_features.append(local_position)
+            #     if local_categorical_features:
+            #         tree.categorical_features = local_categorical_features
+            #     else:
+            #         tree.categorical_features = self.categorical_features
+            # else:
+            #     tree.categorical_features = X.shape[1]
             
-            self.leaf_correction(tree, X_sub, y[indices], self.F_x[indices])
+            local_categorical_features = []
+            for local_position, original_feature in enumerate(feature_indices):
+                if original_feature in self.categorical_features:
+                    local_categorical_features.append(local_position)
+            tree.categorical_features = local_categorical_features
+                
+            if self.symmetrical:
+                tree.fit(X_sub, pseudo_residual_sub)
+                tree.leaf_correction(
+                    y=y_sub_original,
+                    F=self.F_x[indices],
+                    correction_function=self._correct,
+                )
+            else:
+                tree.fit(X_sub, pseudo_residual_sub, encoding_target=y_sub_original)
+                self.leaf_correction(tree, tree.X_train_, y[indices], self.F_x[indices])
             
             self.trees.append(tree)
             self.feature_indices.append(feature_indices)
@@ -139,6 +191,162 @@ class CatBoost:
                 self.F_x += self.learning_rate * tree.predict(X[:, feature_indices])
         return self
     
+    def fit_ordered(self, X, y, X_val=None, y_val=None):
+        self.X_train_ = X
+        self.y_train_ = y
+        
+        self.trees = []
+        self.feature_indices = []
+        
+        number_of_samples = X.shape[0]
+        number_of_features = X.shape[1]
+        sample_size = max(1, int(self.sub_sample * number_of_samples))
+        number_of_selected_features = max(1, int(self.column_sub_sample * number_of_features))
+
+        epsilon = self.config.epsilon
+        match self.loss_type:
+            case self.LossType.BINARY_CROSS_ENTROPY:
+                p0 = np.clip(np.mean(y), epsilon, 1 - epsilon)
+                self.F_0x = np.log(p0 / (1 - p0))
+            case self.LossType.SSE:
+                self.F_0x = np.mean(y)
+            case _:
+                raise ValueError(f"Unsupported {self.LossType}, supported values are {list(self.LossType)}")
+        self.F_x = np.repeat(self.F_0x, y.shape[0])
+        
+        block_size = self.config.ordered_boosting_blocks
+        permutation = self.rng.permutation(number_of_samples)
+        ordered_blocks = [permutation[i:i + block_size] for i in range(0, len(permutation), block_size)]
+        number_of_blocks = len(ordered_blocks)
+        self.F_prefix = [
+            np.repeat(self.F_0x, number_of_samples).astype(float)
+            for _ in range(number_of_blocks)
+        ]
+         
+        best_val_loss = float("inf")
+        patience = 100
+        best_round = -1
+        best_number_of_trees = 0
+        patience_counter = 0
+        for round in range(self.boosting_rounds):
+            ordered_prediction = np.empty(number_of_samples, dtype=float)
+            for b, rows_b in enumerate(ordered_blocks):
+                ordered_prediction[rows_b] = self.F_prefix[b][rows_b]
+            ordered_residual = -self.dloss(y, ordered_prediction)
+
+            if self.symmetrical:
+                tree = ANonSeriousSymmetricalTree(
+                    max_depth=self.max_depth,
+                    minimum_split_size=self.minimum_population_size,
+                    minimum_gain=self.minimum_gain
+                )
+            else:
+                tree = ANonSeriousDecisionTree(
+                    max_depth=self.max_depth,
+                    minimum_population_size=self.minimum_population_size,
+                    minimum_gain=self.minimum_gain,
+                    categorical=False,
+                    adjacent=self.adjacent,
+                    information_gain=self.information_gain,
+                    random_criterion=self.random_criterion,
+                    tree_type=self.tree_type,
+                    catboost=True,
+                )
+            tree.smoothing_strength = self.config.smoothing_strength
+            
+            indices = np.random.choice(number_of_samples, size=sample_size, replace=False)
+            feature_indices = np.random.choice(number_of_features, size=number_of_selected_features, replace=False)
+            
+            X_sub = X[indices][:, feature_indices]
+            ordered_residual_sub = ordered_residual[indices]
+            y_sub_original = y[indices]
+            
+            # if self.categorical_features is not None:
+            #     local_categorical_features = []
+            #     for local_position, original_feature in enumerate(feature_indices):
+            #         if original_feature in self.categorical_features:
+            #             local_categorical_features.append(local_position)
+            #     if len(local_categorical_features) >= 0:
+            #         tree.categorical_features = local_categorical_features
+            #     else:
+            #         tree.categorical_features = self.categorical_features
+            # else:
+            #     tree.categorical_features = X.shape[1]
+            
+            local_categorical_features = []
+            for local_position, original_feature in enumerate(feature_indices):
+                if original_feature in self.categorical_features:
+                    local_categorical_features.append(local_position)
+            tree.categorical_features = local_categorical_features
+            
+            if self.symmetrical:
+                tree.fit(X_sub, ordered_residual_sub)
+                tree.leaf_correction(
+                    y=y_sub_original,
+                    F=ordered_prediction[indices],
+                    correction_function=self._correct,
+                )
+            else:
+                tree.fit(X_sub, ordered_residual_sub, encoding_target=y_sub_original)
+                self.leaf_correction(tree, tree.X_train_, y[indices], ordered_prediction[indices])
+            self.trees.append(tree)
+            self.feature_indices.append(feature_indices)
+            self.F_x += self.learning_rate * tree.predict(X[:, feature_indices])
+            
+            for b in range(number_of_blocks):
+                prefix_rows = np.concatenate(ordered_blocks[:b + 1])
+                auxiliary_tree = ANonSeriousDecisionTree(
+                    max_depth=self.max_depth,
+                    minimum_population_size=self.minimum_population_size,
+                    minimum_gain=self.minimum_gain,
+                    categorical=False,
+                    adjacent=self.adjacent,
+                    information_gain=self.information_gain,
+                    random_criterion=self.random_criterion,
+                    tree_type=self.tree_type,
+                    catboost=True,
+                )
+                auxiliary_tree.smoothing_strength = self.config.smoothing_strength
+                auxiliary_tree.categorical_features = local_categorical_features
+                
+                X_prefix = X[prefix_rows][:, feature_indices]
+                y_prefix_target = ordered_residual[prefix_rows]
+                y_prefix_original = y[prefix_rows]
+                
+                auxiliary_tree.fit(
+                    X_prefix, 
+                    y_prefix_target,
+                    encoding_target=y_prefix_original,
+                )
+                
+                self.leaf_correction(
+                    auxiliary_tree,
+                    auxiliary_tree.X_train_,
+                    y_prefix_original,
+                    ordered_prediction[prefix_rows],
+                )
+                self.F_prefix[b] += self.learning_rate * auxiliary_tree.predict(X[:, feature_indices])
+                
+            if self.validation:
+                _, val_loss = self.evaluate_dataset(X_val, y_val)
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_round = round
+                    patience_counter = 0
+                    best_number_of_trees = len(self.trees)
+                else:
+                    patience_counter += 1
+                if self.early_stopping and patience_counter >= patience:
+                    print("Overfitting detected. Early stopping at round: ", round, "Best Round : ", best_round)
+                    break
+        if self.restore_best and self.validation:
+            self.trees = self.trees[:best_number_of_trees]
+            self.feature_indices = self.feature_indices[:best_number_of_trees]
+            self.F_x = np.repeat(self.F_0x, X.shape[0])
+            for tree, feature_indices in zip(self.trees, self.feature_indices):
+                self.F_x += self.learning_rate * tree.predict(X[:, feature_indices])
+        return self
+
     def dloss(self, y, F_x):
         match self.loss_type:
             case self.LossType.BINARY_CROSS_ENTROPY:
@@ -151,6 +359,9 @@ class CatBoost:
 
     def sse(self, y, F_x):
         return 1 / 2 * (y - F_x) ** 2
+    
+    def sse_mean(self, y, F_x):
+        return np.mean(self.sse(y, F_x))
 
     def sigmoid(self, z):
         z = np.asarray(z, dtype=float)
@@ -209,7 +420,7 @@ class CatBoost:
             case self.LossType.BINARY_CROSS_ENTROPY:
                 loss = self.binary_cross_entropy_loss(y, F_x)
             case self.LossType.SSE:
-                loss = self.sse(y, F_x)
+                loss = self.sse_mean(y, F_x)
             case _:
                 raise ValueError(f"Unsupported {self.LossType}, supported values are {list(self.LossType)}")
         return predictions, loss
@@ -437,7 +648,20 @@ class CatBoost:
             plt.title("Prediction Surface")
             plt.grid(True)
             plt.savefig("boosting/img/prediction_surface.png")
-            plt.show()
+            plt.show()  
+        fig = plt.figure(figsize=(9, 7))
+        ax = fig.add_subplot(111, projection="3d")
+
+        ax.plot_surface(xx1, xx2, zz, alpha=0.7)
+        ax.scatter(X[:, 0], X[:, 1], y, alpha=0.7)
+
+        ax.set_xlabel("Feature 1")
+        ax.set_ylabel("Feature 2")
+        ax.set_zlabel("Target / Prediction")
+        ax.set_title("Learned Regression Surface")
+            
+        plt.savefig("boosting/img/3d_ctbst_srfc.png")
+        plt.show()
 
 
 if __name__ == "__main__":
@@ -455,6 +679,8 @@ if __name__ == "__main__":
         early_stopping=False,
         sub_sample=1,
         column_sub_sample=1,
+        symmetrical=True,
+        boosting_type=CatBoost.BoostingType.PLAIN,
     )
     catboost.fit(X, y, None, None)
     

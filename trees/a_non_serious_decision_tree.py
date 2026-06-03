@@ -333,6 +333,7 @@ class ANonSeriousDecisionTree:
         node=False,
         gradient=None,
         hessian=None,
+        encoding_target=None,
     ):
         if y.ndim == 2:
             y = np.argmax(y, axis=1)
@@ -340,6 +341,10 @@ class ANonSeriousDecisionTree:
             raise ValueError(
                 f"X and y must match in shapes : {X.shape[0]} != {y.shape[0]}"
             )
+        if encoding_target is None:
+            y_for_encoding = y
+        else:
+            y_for_encoding = encoding_target
         root_row_indices = None
         if self.xgboost and self.preprocess:
             self.preprocessed_columns = self._preprocess_columns(X)
@@ -370,7 +375,7 @@ class ANonSeriousDecisionTree:
                         row_indices=root_row_indices,
                     )
         if self.catboost:
-            self.X_train_ = self._catboost_fit_ordered_target_statistics(X, y)
+            self.X_train_ = self._catboost_fit_ordered_target_statistics(X, y_for_encoding)
 
         if node:
             self.root = ANonSeriousNode()
@@ -1414,7 +1419,7 @@ class ANonSeriousDecisionTree:
 
     def catboost_ordered_target_statistics(self, X, y, feature):
         number_of_rows = X.shape[0]
-        encoded = np.arange(0.0, size=number_of_rows)
+        encoded = np.arange(number_of_rows, dtype=float)
 
         count_by_category = {}
         sum_by_category = {}
@@ -1440,33 +1445,36 @@ class ANonSeriousDecisionTree:
 
     def _catboost_fit_ordered_target_statistics(self, X, y):
         X_encoded = copy.deepcopy(X)
-        for feature in X_encoded.shape[1]:
-            encoded_column, count_by_category, sum_by_category, prior = (
+        self.catboost_statistics = {}
+        for feature in self.categorical_features:
+            encoded_column, count_by_category, sum_by_category = (
                 self.catboost_ordered_target_statistics(X, y, feature)
             )
-            X[:, feature] = encoded_column
+            X_encoded[:, feature] = encoded_column
             self.catboost_statistics[feature] = {
                 "count_by_category": count_by_category,
                 "sum_by_category": sum_by_category,
-                "prior": prior,
             }
         return X_encoded
 
     def _transform_categories(self, X):
         X_encoded = copy.deepcopy(X)
         prior_weight = self.smoothing_strength
-        for feature in X_encoded.shape[1]:
-            for row in X_encoded[:, feature]:
+        for feature in self.categorical_features:
+            stats = self.catboost_statistics[feature]
+            for row in range(X_encoded[:, feature].shape[0]):
                 category_value = X_encoded[row, feature]
-                if category_value in self.catboost_statistics:
+                if category_value in stats["count_by_category"]:
                     encoded_value = (
-                        self.catboost_statistics["sum_by_category"]
+                        stats["sum_by_category"][category_value]
                         + prior_weight * self.global_prior
-                    ) / (self.catboost_statistics["count_by_category"] + prior_weight)
-                X_encoded[row, feature] = encoded_value
+                    ) / (stats["count_by_category"][category_value] + prior_weight)
+                    X_encoded[row, feature] = encoded_value
+                else:
+                    X_encoded[row, feature] = self.global_prior
         return X_encoded
 
-    def predict_one(self, x, node=None, verbose=False, leaf_node=False):
+    def predict_one(self, x, node=None, leaf_node=False):
         if node is None:
             node = self.root
 
