@@ -2319,10 +2319,6 @@ class NeuralNetwork:
         )
 
     def _label_to_class_index(self, y):
-        """
-        Converts one-hot label or scalar label into an integer class index.
-        """
-
         y_cpu = self.to_cpu(y)
         y_cpu = np.asarray(y_cpu)
 
@@ -2338,15 +2334,6 @@ class NeuralNetwork:
 
 
     def _vector_to_grid(self, vector, input_shape=None):
-        """
-        Converts a 1D vector into a 2D image/grid.
-
-        If input_shape is given and the vector size matches it,
-        it reshapes using the original image geometry.
-
-        Otherwise, it arranges neurons into a square-ish grid.
-        """
-
         vector = np.asarray(vector).flatten()
         n = vector.size
 
@@ -2363,11 +2350,6 @@ class NeuralNetwork:
 
 
     def _normalize_0_1(self, x):
-        """
-        Normalizes finite values to [0, 1].
-        NaN values stay NaN.
-        """
-
         x = np.asarray(x, dtype=float)
         out = x.copy()
 
@@ -2394,16 +2376,6 @@ class NeuralNetwork:
         mode="input_x_gradient",
         normalize=True,
     ):
-        """
-        Computes a saliency map over the original input pixels.
-
-        Bright pixel = pixel that strongly influences the selected class score.
-
-        mode:
-            "gradient"          -> abs(dScore/dInput)
-            "input_x_gradient"  -> abs(Input * dScore/dInput)
-        """
-
         xp = self.xp
 
         x_sample = self.to_device(x_sample, dtype=xp.float32)
@@ -2421,7 +2393,6 @@ class NeuralNetwork:
 
         output_cpu = self.to_cpu(A)
 
-        # Decide target class
         if target_class is None:
             if A.shape[1] == 1:
                 target_class = int(output_cpu[0, 0] >= 0.5)
@@ -2440,7 +2411,6 @@ class NeuralNetwork:
 
         grad = dZ
 
-        # Backpropagate from output layer to input layer
         for layer_index in range(self.__L - 1, -1, -1):
             W, b = self.__WB[layer_index]
 
@@ -2489,15 +2459,6 @@ class NeuralNetwork:
         mode="input_x_gradient",
         pause=0.01,
     ):
-        """
-        Live visualization of what original pixels the model is using.
-
-        Shows:
-            1. Original 28x28 image
-            2. Saliency map
-            3. Saliency overlay on original image
-        """
-
         if target_class is None and y_sample is not None:
             target_class = self._label_to_class_index(y_sample)
 
@@ -2654,7 +2615,6 @@ class NeuralNetwork:
             W, b = self.__WB[layer_index]
 
             # Z = A_prev @ W.T + b.T
-            # Therefore dA_prev = dZ @ W
             dA_prev = dZ @ W
 
             A_prev = cache[layer_index]
