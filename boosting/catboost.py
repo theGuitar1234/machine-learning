@@ -1,11 +1,13 @@
+import copy
 from dataclasses import dataclass
 from enum import Enum
 
 from sklearn import datasets
-import numpy as np
 from sklearn.model_selection import train_test_split
+from itertools import combinations
 
 import matplotlib.pyplot as plt
+import numpy as np
 import os
 
 from trees import ANonSeriousDecisionTree
@@ -27,6 +29,10 @@ class CatBoost:
         epsilon=1e-12
         smoothing_strength: int = 10
         ordered_boosting_blocks: int = 10
+        max_ctr_complexity: int = 2
+        min_combo_count: int = 5
+        max_number_of_combos: int = 20
+        one_hot_max_size: int = 2
 
     def __init__(
         self,
@@ -50,6 +56,7 @@ class CatBoost:
         boosting_type=BoostingType.PLAIN,
         encoding_target=None,
         categorical_features=None,
+        categorical_combinations=None,
         config=TrainDefaults(),
     ):
         if not (0 < sub_sample <= 1) or not (0 < column_sub_sample <= 1):
@@ -72,6 +79,10 @@ class CatBoost:
         self.restore_best = restore_best
         self.validation = validation
         self.categorical_features = categorical_features or []
+        self.categorical_combinations = categorical_combinations or []
+        self.one_hot_features = []
+        self.ctr_features = []
+        self.one_hot_categories = {}
         self.encoding_target = encoding_target
         self.boosting_type = boosting_type
         self.symmetrical = symmetrical
@@ -86,6 +97,11 @@ class CatBoost:
         
         self.trees = []
         self.feature_indices = []
+        self.encoding_statistics = []
+
+        # X_model = self._feature_transformer(X, y)
+        # self.X_train_ = X_model
+        # X = X_model
         
         number_of_samples = X.shape[0]
         number_of_features = X.shape[1]
@@ -138,24 +154,10 @@ class CatBoost:
             pseudo_residual_sub = pseudo_residual[indices]
             y_sub_original = y[indices]
             
-            # if self.categorical_features is not None:
-            #     local_categorical_features = []
-            #     for local_position, original_feature in enumerate(feature_indices):
-            #         if original_feature in self.categorical_features:
-            #             local_categorical_features.append(local_position)
-            #     if local_categorical_features:
-            #         tree.categorical_features = local_categorical_features
-            #     else:
-            #         tree.categorical_features = self.categorical_features
-            # else:
-            #     tree.categorical_features = X.shape[1]
-            
-            local_categorical_features = []
-            for local_position, original_feature in enumerate(feature_indices):
-                if original_feature in self.categorical_features:
-                    local_categorical_features.append(local_position)
+            # Deprecated - obselete after feature transformer
+            local_categorical_features = self._local_categorical_features(feature_indices)
             tree.categorical_features = local_categorical_features
-                
+   
             if self.symmetrical:
                 tree.fit(X_sub, pseudo_residual_sub)
                 tree.leaf_correction(
@@ -197,6 +199,10 @@ class CatBoost:
         
         self.trees = []
         self.feature_indices = []
+        
+        X_model = self._feature_transformer(X, y)
+        self.X_train_ = X_model
+        X = X_model
         
         number_of_samples = X.shape[0]
         number_of_features = X.shape[1]
@@ -261,22 +267,8 @@ class CatBoost:
             ordered_residual_sub = ordered_residual[indices]
             y_sub_original = y[indices]
             
-            # if self.categorical_features is not None:
-            #     local_categorical_features = []
-            #     for local_position, original_feature in enumerate(feature_indices):
-            #         if original_feature in self.categorical_features:
-            #             local_categorical_features.append(local_position)
-            #     if len(local_categorical_features) >= 0:
-            #         tree.categorical_features = local_categorical_features
-            #     else:
-            #         tree.categorical_features = self.categorical_features
-            # else:
-            #     tree.categorical_features = X.shape[1]
-            
-            local_categorical_features = []
-            for local_position, original_feature in enumerate(feature_indices):
-                if original_feature in self.categorical_features:
-                    local_categorical_features.append(local_position)
+            # Deprecated - obselete after feature transformer
+            local_categorical_features = self._local_categorical_features(self, feature_indices)
             tree.categorical_features = local_categorical_features
             
             if self.symmetrical:
@@ -346,6 +338,78 @@ class CatBoost:
             for tree, feature_indices in zip(self.trees, self.feature_indices):
                 self.F_x += self.learning_rate * tree.predict(X[:, feature_indices])
         return self
+    
+    def _local_categorical_features(self, feature_indices):
+        local_categorical_features = []
+        for local_position, original_feature in enumerate(feature_indices):
+            if original_feature in self.categorical_features:
+                local_categorical_features.append(local_position)
+        return local_categorical_features
+    
+    def _feature_transformer(self, X, y):
+        self.numeric_features = []
+        for feature in range(X.shape[1]):
+            if feature not in self.categorical_features:
+                self.numeric_features.append(feature)
+        self.preprocess_categorical_features(X)
+        self._one_hot_encode(X)
+        self.preprocess_categorical_combinations()
+        return self._transform_features(X, y, training_mode=True)
+    
+    # def _transform_features(self, X, y=None, training_mode=False):
+    #     columns = []
+        
+    #     for numeric_feature in self.numeric_features:
+    #         columns.append(X[:, numeric_feature])
+    #     for one_hot_feature in self.one_hot_features:
+    #         columns.append(X[:, one_hot_feature] == one_hot_feature)
+    #     if training_mode:
+    #         for ctr_feature in self.ctr_features:
+    #             encoded_col, ctr_stats = self._fit_ordered_ctr(X[:, ctr_feature], y)
+    #             self.ctr_statistics = ctr_stats
+    #             columns.append(encoded_col)
+    #         for combo in self.categorical_combinations:
+    #             columns.append(combo)
+    #     else:
+            
+    #     return np.column_stack(columns).astype(float)
+    
+    def preprocess_categorical_combinations(self):
+        self.categorical_combinations = []
+        pairs = list(combinations(self.ctr_features, 2))
+        if len(pairs) > self.config.max_number_of_combos:
+            chosen_indices = self.rng.choice(
+                len(pairs),
+                size=self.config.max_number_of_combos,
+                replace=False, 
+            )
+            pairs = [pairs[i] for i in chosen_indices]
+        self.categorical_combinations = pairs
+    
+    def preprocess_categorical_features(self, X):
+        self.one_hot_features = []
+        self.ctr_features = []
+        for feature in self.categorical_features:
+            unique_count = len(np.unique(X[:, feature]))
+            if unique_count <= self.config.one_hot_max_size:
+                self.one_hot_features.append(feature)
+            else:
+                self.ctr_features.append(feature)
+    
+    def _one_hot_encode(self, X):
+        self.one_hot_categories = {}
+        for feature in self.one_hot_features:
+            categories = np.unique(X[:, feature])
+            self.one_hot_categories[feature] = categories
+    
+    def _transform_one_hot(self, X):
+        columns = []
+        for feature in self.one_hot_features:
+            categories = self.one_hot_categories[feature]
+            for category in categories:
+                column = X[:, feature] == category
+                columns.append(column.astype(float))
+        return columns
 
     def dloss(self, y, F_x):
         match self.loss_type:
@@ -428,6 +492,7 @@ class CatBoost:
     def predict(self, X):
         if self.F_0x is None:
             raise RuntimeError("Model is not fit")
+        # X_model = self._transform_features(X)
         prediction = np.repeat(self.F_0x, X.shape[0])
         for tree, feature_indices in zip(self.trees, self.feature_indices):
             prediction += self.learning_rate * tree.predict(X[:, feature_indices])
@@ -679,8 +744,8 @@ if __name__ == "__main__":
         early_stopping=False,
         sub_sample=1,
         column_sub_sample=1,
-        symmetrical=True,
-        boosting_type=CatBoost.BoostingType.PLAIN,
+        symmetrical=False,
+        boosting_type=CatBoost.BoostingType.ORDERED,
     )
     catboost.fit(X, y, None, None)
     

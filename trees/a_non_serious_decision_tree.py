@@ -1318,8 +1318,7 @@ class ANonSeriousDecisionTree:
 
     def _xgboost_gain(self, G_parent, G_left, G_right, H_parent, H_left, H_right):
         return (
-            1
-            / 2
+            1 / 2
             * (
                 G_left**2 / (H_left + self.l2)
                 + G_right**2 / (H_right + self.l2)

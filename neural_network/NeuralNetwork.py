@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+from numba import njit
 import os
 import csv
 import copy
@@ -13,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 import numpy as np
+from sklearn.model_selection import train_test_split
 
 try:
     import cupy as cp
@@ -686,6 +688,7 @@ class NeuralNetwork:
                     f"Unknown Layer Strategy, supported values are: {cls.LayerStrategies.CONSTANT_WIDTH}, {cls.LayerStrategies.LINEAR_TAPER_FUNNEL}, {cls.LayerStrategies.LINEAR_TAPER_FUNNEL_OUTPUT}, {cls.LayerStrategies.GEOMETRIC_TAPER}, {cls.LayerStrategies.EXPANSION_COMPRESSION}, {cls.LayerStrategies.BOTTLENECK_HOURGLASS}, {cls.LayerStrategies.POWER_OF_TWO}, {cls.LayerStrategies.REVERSE_POWER_OF_TWO}, {cls.LayerStrategies.PARAMETER_BUDGET}"
                 )
 
+        print(hidden + [output_width])
         return hidden + [output_width]
 
     @classmethod
@@ -1258,6 +1261,12 @@ class NeuralNetwork:
         learning_decay_type=None,
         data_augmentation_type=None,
         optimizer_type=None,
+        contribution_sample=None,
+        contribution_label=None,
+        contribution_target_class=None,
+        contribution_every=1,
+        contribution_input_shape=(28, 28),
+        contribution_use_true_label=True,
     ):
         xp = self.xp
         if X_train.ndim != 2:
@@ -1414,6 +1423,16 @@ class NeuralNetwork:
                     self.optimizer(grads, current_lr, optimizer_type, cfg)
 
                 batch_loss = self.loss(Y_batch, A, epsilon)
+                if contribution_sample is not None and epoch % contribution_every == 0:
+                    self.visualize_full_layer_contributions_live(
+                        x_sample=contribution_sample,
+                        y_sample=contribution_label,
+                        target_class=contribution_target_class,
+                        epoch=epoch,
+                        input_shape=contribution_input_shape,
+                        use_true_label_as_target=contribution_use_true_label,
+                        pause=0.01,
+                    )
                 train_data_loss += batch_loss * (end - batch_start)
 
             if self.on_gpu:
@@ -1456,13 +1475,8 @@ class NeuralNetwork:
                     val_accuracies.append(val_acc)
                     steps.append(epoch)
                 if synch and real_time_tracking:
-                    plt.ion()
-                    plt.title(self.TrainResults.figure_title)
-                    plt.plot(steps, train_losses, label="Train Loss")
-                    plt.plot(steps, val_losses, label="Validation Loss")
-                    plt.xlabel("iteration")
-                    plt.ylabel("loss")
-                    plt.pause(0.05)
+                    self.plot_real_time(steps, train_losses, val_losses)
+                    # self.visualize_learning_real_time(self.to_cpu(A))
 
             if best_val_loss - val_data_loss > validation_tolerance:
                 best_val_loss = val_data_loss
@@ -1585,13 +1599,7 @@ class NeuralNetwork:
                 )
 
         if synch and graph:
-            plt.ioff()
-            plt.title(self.TrainResults.figure_title)
-            plt.plot(steps, train_losses, label="Train Loss")
-            plt.plot(steps, val_losses, label="Validation Loss")
-            plt.xlabel("iteration")
-            plt.ylabel("loss")
-            plt.show()
+            self.plot(steps, train_losses, val_losses)
 
         return train_results
 
@@ -1961,6 +1969,42 @@ class NeuralNetwork:
 
         return X_aug, Y_aug
 
+    def plot_real_time(self, steps, train_losses, val_losses):
+        plt.ion()
+        plt.title(self.TrainResults.figure_title)
+        plt.plot(steps, train_losses, label="Train Loss")
+        plt.plot(steps, val_losses, label="Validation Loss")
+        plt.xlabel("iteration")
+        plt.ylabel("loss")
+        plt.pause(0.05)
+    
+    def plot(self, steps, train_losses, val_losses):
+        plt.ioff()
+        plt.title(self.TrainResults.figure_title)
+        plt.plot(steps, train_losses, label="Train Loss")
+        plt.plot(steps, val_losses, label="Validation Loss")
+        plt.xlabel("iteration")
+        plt.ylabel("loss")
+        plt.show()
+    
+    def visualize_learning_real_time(self, A):
+        A_cpu = self.to_cpu(A)
+        if A_cpu.ndim == 1:
+            A_cpu = A_cpu.reshape(1, -1)
+        plt.ion()
+        plt.title("Activations heatmap")
+        # https://www.google.com/search?q=youtube+kolmogorov+neural+network&rlz=1C1JJTC_enAZ1150AZ1150&oq=youtube+kolmogorov+neural+network&gs_lcrp=EgZjaHJvbWUyBggAEEUYOTIHCAEQIRigATIHCAIQIRifBTIHCAMQIRifBTIHCAQQIRifBTIHCAUQIRifBTIHCAYQIRifBdIBCDU1ODJqMGo0qAIAsAIB&sourceid=chrome&ie=UTF-8#fpstate=ive&vld=cid:c33dbddc,vid:myFtp5zMv8U,st:0
+        plt.imshow(
+            A_cpu,
+            aspect="auto",
+            vmin=0,
+            vmax=1,
+            cmap="gray"
+        )
+        plt.xlabel("Neuron")
+        plt.ylabel("Sample")
+        plt.pause(0.05)
+
     @staticmethod
     def one_hot_encode(Y, classes):
         if type(Y) is not np.ndarray:
@@ -2274,36 +2318,661 @@ class NeuralNetwork:
             f"parameters={self.parameter_count()})"
         )
 
+    def _label_to_class_index(self, y):
+        """
+        Converts one-hot label or scalar label into an integer class index.
+        """
+
+        y_cpu = self.to_cpu(y)
+        y_cpu = np.asarray(y_cpu)
+
+        if y_cpu.ndim == 2:
+            return int(np.argmax(y_cpu[0]))
+
+        if y_cpu.ndim == 1:
+            if y_cpu.size > 1:
+                return int(np.argmax(y_cpu))
+            return int(y_cpu[0])
+
+        return int(y_cpu)
+
+
+    def _vector_to_grid(self, vector, input_shape=None):
+        """
+        Converts a 1D vector into a 2D image/grid.
+
+        If input_shape is given and the vector size matches it,
+        it reshapes using the original image geometry.
+
+        Otherwise, it arranges neurons into a square-ish grid.
+        """
+
+        vector = np.asarray(vector).flatten()
+        n = vector.size
+
+        if input_shape is not None and n == input_shape[0] * input_shape[1]:
+            return vector.reshape(input_shape)
+
+        cols = int(np.ceil(np.sqrt(n)))
+        rows = int(np.ceil(n / cols))
+
+        grid = np.full((rows, cols), np.nan)
+        grid.flat[:n] = vector
+
+        return grid
+
+
+    def _normalize_0_1(self, x):
+        """
+        Normalizes finite values to [0, 1].
+        NaN values stay NaN.
+        """
+
+        x = np.asarray(x, dtype=float)
+        out = x.copy()
+
+        mask = np.isfinite(out)
+
+        if not np.any(mask):
+            return out
+
+        min_val = np.min(out[mask])
+        max_val = np.max(out[mask])
+
+        if max_val == min_val:
+            out[mask] = 0.0
+        else:
+            out[mask] = (out[mask] - min_val) / (max_val - min_val)
+
+        return out
+
+    def input_saliency_map(
+        self,
+        x_sample,
+        target_class=None,
+        input_shape=(28, 28),
+        mode="input_x_gradient",
+        normalize=True,
+    ):
+        """
+        Computes a saliency map over the original input pixels.
+
+        Bright pixel = pixel that strongly influences the selected class score.
+
+        mode:
+            "gradient"          -> abs(dScore/dInput)
+            "input_x_gradient"  -> abs(Input * dScore/dInput)
+        """
+
+        xp = self.xp
+
+        x_sample = self.to_device(x_sample, dtype=xp.float32)
+
+        if x_sample.ndim == 1:
+            x_sample = x_sample.reshape(1, -1)
+
+        if x_sample.shape[0] != 1:
+            raise ValueError("input_saliency_map expects exactly one sample, shape (1, features).")
+
+        A, cache, activation_cache, M = self.forward_pass(
+            x_sample,
+            training_mode=False
+        )
+
+        output_cpu = self.to_cpu(A)
+
+        # Decide target class
+        if target_class is None:
+            if A.shape[1] == 1:
+                target_class = int(output_cpu[0, 0] >= 0.5)
+            else:
+                target_class = int(np.argmax(output_cpu[0]))
+
+        dZ = xp.zeros_like(A)
+
+        if A.shape[1] == 1:
+            if int(target_class) == 1:
+                dZ[0, 0] = 1.0
+            else:
+                dZ[0, 0] = -1.0
+        else:
+            dZ[0, int(target_class)] = 1.0
+
+        grad = dZ
+
+        # Backpropagate from output layer to input layer
+        for layer_index in range(self.__L - 1, -1, -1):
+            W, b = self.__WB[layer_index]
+
+            # Z = A_prev @ W.T + b.T
+            # dA_prev = dZ @ W
+            dA_prev = grad @ W
+
+            if layer_index > 0:
+                previous_activation = cache[layer_index]
+                grad = dA_prev * self.hidden_derivative_from_output(previous_activation)
+            else:
+                input_gradient = dA_prev
+
+        input_gradient_cpu = self.to_cpu(input_gradient[0])
+        image_cpu = self.to_cpu(x_sample[0])
+
+        if mode == "gradient":
+            saliency = np.abs(input_gradient_cpu)
+        elif mode == "input_x_gradient":
+            saliency = np.abs(image_cpu * input_gradient_cpu)
+        else:
+            raise ValueError('mode must be "gradient" or "input_x_gradient".')
+
+        saliency = saliency.reshape(input_shape)
+        image = image_cpu.reshape(input_shape)
+
+        if normalize:
+            saliency_min = np.min(saliency)
+            saliency_max = np.max(saliency)
+
+            if saliency_max > saliency_min:
+                saliency = (saliency - saliency_min) / (saliency_max - saliency_min)
+            else:
+                saliency = np.zeros_like(saliency)
+
+        predicted_class = int(np.argmax(output_cpu[0])) if A.shape[1] > 1 else int(output_cpu[0, 0] >= 0.5)
+
+        return saliency, image, predicted_class, int(target_class), output_cpu  
+    def visualize_sample_saliency_live(
+        self,
+        x_sample,
+        y_sample=None,
+        target_class=None,
+        epoch=None,
+        input_shape=(28, 28),
+        mode="input_x_gradient",
+        pause=0.01,
+    ):
+        """
+        Live visualization of what original pixels the model is using.
+
+        Shows:
+            1. Original 28x28 image
+            2. Saliency map
+            3. Saliency overlay on original image
+        """
+
+        if target_class is None and y_sample is not None:
+            target_class = self._label_to_class_index(y_sample)
+
+        saliency, image, predicted_class, target_class, output = self.input_saliency_map(
+            x_sample=x_sample,
+            target_class=target_class,
+            input_shape=input_shape,
+            mode=mode,
+            normalize=True,
+        )
+
+        if not hasattr(self, "_saliency_live_fig"):
+            self._saliency_live_fig = None
+
+        if self._saliency_live_fig is None or not plt.fignum_exists(self._saliency_live_fig.number):
+            plt.ion()
+            self._saliency_live_fig, self._saliency_live_axes = plt.subplots(
+                1,
+                3,
+                figsize=(12, 4)
+            )
+
+        fig = self._saliency_live_fig
+        axes = self._saliency_live_axes
+
+        for ax in axes:
+            ax.clear()
+
+        axes[0].imshow(
+            image,
+            cmap="gray",
+            interpolation="nearest",
+            aspect="equal"
+        )
+        axes[0].set_title("Original input")
+
+        axes[1].imshow(
+            saliency,
+            cmap="hot",
+            interpolation="nearest",
+            aspect="equal",
+            vmin=0,
+            vmax=1
+        )
+        axes[1].set_title("Pixel importance")
+
+        axes[2].imshow(
+            image,
+            cmap="gray",
+            interpolation="nearest",
+            aspect="equal"
+        )
+        axes[2].imshow(
+            saliency,
+            cmap="hot",
+            interpolation="nearest",
+            aspect="equal",
+            alpha=0.55,
+            vmin=0,
+            vmax=1
+        )
+        axes[2].set_title("Overlay")
+
+        for ax in axes:
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+        title = f"Target class: {target_class} | Predicted: {predicted_class}"
+
+        if output.shape[1] > 1:
+            confidence = float(output[0, predicted_class])
+            title += f" | Confidence: {confidence:.4f}"
+        else:
+            confidence = float(output[0, 0])
+            title += f" | Output: {confidence:.4f}"
+
+        if epoch is not None:
+            title += f" | Epoch: {epoch}"
+
+        fig.suptitle(title)
+        fig.tight_layout()
+
+        plt.pause(pause)
+
+        return saliency   
+
+    def layer_contribution_analysis(
+        self,
+        x_sample,
+        y_sample=None,
+        target_class=None,
+        input_shape=(28, 28),
+        use_true_label_as_target=True,
+    ):
+        xp = self.xp
+
+        x_sample = self.to_device(x_sample, dtype=xp.float32)
+
+        if x_sample.ndim == 1:
+            x_sample = x_sample.reshape(1, -1)
+
+        if x_sample.shape[0] != 1:
+            raise ValueError("This visualizer expects exactly one sample: shape (1, features).")
+
+        A, cache, activation_cache, M = self.forward_pass(
+            x_sample,
+            training_mode=False
+        )
+
+        output_cpu = self.to_cpu(A)
+
+        predicted_class = (
+            int(np.argmax(output_cpu[0]))
+            if A.shape[1] > 1
+            else int(output_cpu[0, 0] >= 0.5)
+        )
+
+        if target_class is None:
+            if y_sample is not None and use_true_label_as_target:
+                target_class = self._label_to_class_index(y_sample)
+            else:
+                target_class = predicted_class
+
+        target_class = int(target_class)
+
+        dZ = xp.zeros_like(A)
+
+        if A.shape[1] == 1:
+            dZ[0, 0] = 1.0 if target_class == 1 else -1.0
+        else:
+            dZ[0, target_class] = 1.0
+
+        number_of_cached_layers = len(cache)
+
+        activation_layers = [None] * number_of_cached_layers
+        contribution_layers = [None] * number_of_cached_layers
+        signed_contribution_layers = [None] * number_of_cached_layers
+        gradient_layers = [None] * number_of_cached_layers
+
+        for i in range(number_of_cached_layers):
+            activation_layers[i] = self.to_cpu(cache[i])
+
+        output_contribution = xp.zeros_like(A)
+        if A.shape[1] == 1:
+            output_contribution[0, 0] = xp.abs(A[0, 0])
+        else:
+            output_contribution[0, target_class] = xp.abs(A[0, target_class])
+
+        contribution_layers[-1] = self.to_cpu(output_contribution)
+        signed_contribution_layers[-1] = self.to_cpu(output_contribution)
+        gradient_layers[-1] = self.to_cpu(dZ)
+
+        for layer_index in range(self.__L - 1, -1, -1):
+            W, b = self.__WB[layer_index]
+
+            # Z = A_prev @ W.T + b.T
+            # Therefore dA_prev = dZ @ W
+            dA_prev = dZ @ W
+
+            A_prev = cache[layer_index]
+
+            signed_contribution = A_prev * dA_prev
+            absolute_contribution = xp.abs(signed_contribution)
+
+            gradient_layers[layer_index] = self.to_cpu(dA_prev)
+            signed_contribution_layers[layer_index] = self.to_cpu(signed_contribution)
+            contribution_layers[layer_index] = self.to_cpu(absolute_contribution)
+
+            if layer_index > 0:
+                previous_activation = cache[layer_index]
+                dZ = dA_prev * self.hidden_derivative_from_output(previous_activation)
+
+        return {
+            "activations": activation_layers,
+            "contributions": contribution_layers,
+            "signed_contributions": signed_contribution_layers,
+            "gradients": gradient_layers,
+            "output": output_cpu,
+            "predicted_class": predicted_class,
+            "target_class": target_class,
+        }
+    
+    def visualize_full_layer_contributions_live(
+        self,
+        x_sample,
+        y_sample=None,
+        target_class=None,
+        epoch=None,
+        input_shape=(28, 28),
+        use_true_label_as_target=True,
+        pause=0.01,
+        activation_cmap="gray",
+        contribution_cmap="hot",
+    ):
+        analysis = self.layer_contribution_analysis(
+            x_sample=x_sample,
+            y_sample=y_sample,
+            target_class=target_class,
+            input_shape=input_shape,
+            use_true_label_as_target=use_true_label_as_target,
+        )
+
+        activations = analysis["activations"]
+        contributions = analysis["contributions"]
+        output = analysis["output"]
+        predicted_class = analysis["predicted_class"]
+        target_class = analysis["target_class"]
+
+        number_of_layers = len(activations)
+
+        if not hasattr(self, "_full_contribution_live_fig"):
+            self._full_contribution_live_fig = None
+            self._full_contribution_live_layer_count = None
+
+        needs_new_figure = (
+            self._full_contribution_live_fig is None
+            or not plt.fignum_exists(self._full_contribution_live_fig.number)
+            or self._full_contribution_live_layer_count != number_of_layers
+        )
+
+        if needs_new_figure:
+            plt.ion()
+
+            fig_width = max(14, number_of_layers * 3.2)
+            fig_height = 7
+
+            self._full_contribution_live_fig, self._full_contribution_live_axes = plt.subplots(
+                2,
+                number_of_layers,
+                figsize=(fig_width, fig_height)
+            )
+
+            self._full_contribution_live_layer_count = number_of_layers
+
+        fig = self._full_contribution_live_fig
+        axes = self._full_contribution_live_axes
+
+        if number_of_layers == 1:
+            axes = np.asarray(axes).reshape(2, 1)
+
+        for row in range(2):
+            for col in range(number_of_layers):
+                axes[row, col].clear()
+
+        for layer_index in range(number_of_layers):
+            activation = np.asarray(activations[layer_index])
+            contribution = np.asarray(contributions[layer_index])
+
+            if activation.ndim == 1:
+                activation = activation.reshape(1, -1)
+
+            if contribution.ndim == 1:
+                contribution = contribution.reshape(1, -1)
+
+            activation_vector = activation[0]
+            contribution_vector = contribution[0]
+
+            if layer_index == 0:
+                activation_grid = self._vector_to_grid(
+                    activation_vector,
+                    input_shape=input_shape
+                )
+            else:
+                activation_grid = self._vector_to_grid(
+                    activation_vector,
+                    input_shape=None
+                )
+
+            activation_grid = self._normalize_0_1(activation_grid)
+            activation_grid = np.ma.masked_invalid(activation_grid)
+
+            axes[0, layer_index].imshow(
+                activation_grid,
+                cmap=activation_cmap,
+                interpolation="nearest",
+                aspect="equal",
+                vmin=0,
+                vmax=1
+            )
+
+            if layer_index == 0:
+                image_grid = self._vector_to_grid(
+                    activation_vector,
+                    input_shape=input_shape
+                )
+
+                contribution_grid = self._vector_to_grid(
+                    contribution_vector,
+                    input_shape=input_shape
+                )
+
+                image_grid = self._normalize_0_1(image_grid)
+                contribution_grid = self._normalize_0_1(contribution_grid)
+
+                axes[1, layer_index].imshow(
+                    image_grid,
+                    cmap="gray",
+                    interpolation="nearest",
+                    aspect="equal",
+                    vmin=0,
+                    vmax=1
+                )
+
+                axes[1, layer_index].imshow(
+                    contribution_grid,
+                    cmap=contribution_cmap,
+                    interpolation="nearest",
+                    aspect="equal",
+                    alpha=0.65,
+                    vmin=0,
+                    vmax=1
+                )
+
+            else:
+                contribution_grid = self._vector_to_grid(
+                    contribution_vector,
+                    input_shape=None
+                )
+
+                contribution_grid = self._normalize_0_1(contribution_grid)
+                contribution_grid = np.ma.masked_invalid(contribution_grid)
+
+                axes[1, layer_index].imshow(
+                    contribution_grid,
+                    cmap=contribution_cmap,
+                    interpolation="nearest",
+                    aspect="equal",
+                    vmin=0,
+                    vmax=1
+                )
+
+            if layer_index == 0:
+                layer_title = "Input"
+            elif layer_index == number_of_layers - 1:
+                layer_title = "Output"
+            else:
+                layer_title = f"Hidden {layer_index}"
+
+            axes[0, layer_index].set_title(
+                f"{layer_title}\nActivations\n{activation_vector.size} units"
+            )
+
+            axes[1, layer_index].set_title(
+                f"{layer_title}\nContribution to class {target_class}"
+            )
+
+            axes[0, layer_index].set_xticks([])
+            axes[0, layer_index].set_yticks([])
+            axes[1, layer_index].set_xticks([])
+            axes[1, layer_index].set_yticks([])
+
+        if output.shape[1] > 1:
+            confidence = float(output[0, predicted_class])
+            target_score = float(output[0, target_class])
+            title = (
+                f"Layer activations + contributions"
+                f" | target: {target_class}"
+                f" | predicted: {predicted_class}"
+                f" | pred confidence: {confidence:.4f}"
+                f" | target score: {target_score:.4f}"
+            )
+        else:
+            confidence = float(output[0, 0])
+            title = (
+                f"Layer activations + contributions"
+                f" | target: {target_class}"
+                f" | predicted: {predicted_class}"
+                f" | output: {confidence:.4f}"
+            )
+
+        if epoch is not None:
+            title += f" | epoch: {epoch}"
+
+        fig.suptitle(title, fontsize=13)
+        fig.tight_layout()
+
+        plt.pause(pause)
+
+        return analysis
 
 if __name__ == "__main__":
-    number_of_classes = 10
-    dataset = NeuralNetwork.load_from_npz("data/npz/MNIST.npz")
+    number_of_classes = 1
+    seed = 42
+    # dataset = NeuralNetwork.load_from_npz("data/npz/MNIST.npz")
+    def spiral_of_clouds(
+        n_objects_by_class,
+        radius=5,
+        n_turns=3,
+        sigma=0.12,
+        seed=0,
+        angle=0,
+        b=0.18,
+    ):
+        rng = np.random.default_rng(seed)
+
+        theta = np.linspace(0, 2 * np.pi * n_turns, n_objects_by_class)
+
+        r = np.exp(b * theta) - 1
+        r = radius * r / r.max()
+
+        def arm(k):
+            t = theta + k * np.pi + angle
+
+            x = r * np.cos(t)
+            y = r * np.sin(t)
+
+            points = np.column_stack([x, y])
+            points += rng.normal(scale=sigma, size=points.shape)
+
+            return points
+
+        X0 = arm(0)
+        X1 = arm(1)
+
+        X = np.vstack([X0, X1]).astype(np.float32)
+
+        # IMPORTANT:
+        # Binary sigmoid wants shape: (samples, 1), not (samples,)
+        Y = np.array(
+            [0] * n_objects_by_class + [1] * n_objects_by_class,
+            dtype=np.float32
+        ).reshape(-1, 1)
+
+        return X, Y
+    X, Y = spiral_of_clouds(
+        n_objects_by_class=1000,
+        radius=5,
+        n_turns=3,
+        sigma=0.08,
+        seed=seed,
+        b=0.12
+    )
+
+    X_train_val, X_test, Y_train_val, Y_test = train_test_split(
+        X,
+        Y,
+        test_size=0.20,
+        random_state=seed,
+        stratify=Y.ravel()
+    )
+
+    X_train, X_valid, Y_train, Y_valid = train_test_split(
+        X_train_val,
+        Y_train_val,
+        test_size=0.25,
+        random_state=seed,
+        stratify=Y_train_val.ravel()
+    )
+        
     # json_dataset = NeuralNetwork.load_from_json('data/json/test.json')
     # prepared_dataset = dataset
-    prepared_dataset = NeuralNetwork.prepare_datasets(dataset, number_of_classes)
+    # prepared_dataset = NeuralNetwork.prepare_datasets(dataset, number_of_classes)
 
-    X_train = prepared_dataset["X_train"]
-    Y_train = prepared_dataset["Y_train"]
-    X_valid = prepared_dataset["X_valid"]
-    Y_valid = prepared_dataset["Y_valid"]
-    X_test = prepared_dataset["X_test"]
-    Y_test = prepared_dataset["Y_test"]
+    # X_train = prepared_dataset["X_train"]
+    # Y_train = prepared_dataset["Y_train"]
+    # X_valid = prepared_dataset["X_valid"]
+    # Y_valid = prepared_dataset["Y_valid"]
+    # X_test = prepared_dataset["X_test"]
+    # Y_test = prepared_dataset["Y_test"]
     
-    X_train = X_train.astype(np.float32) / 255.0
-    X_valid = X_valid.astype(np.float32) / 255.0
-    X_test = X_test.astype(np.float32) / 255.0
+    # X_train = X_train.astype(np.float32) / 255.0
+    # X_valid = X_valid.astype(np.float32) / 255.0
+    # X_test = X_test.astype(np.float32) / 255.0
 
     number_of_features = X_train.shape[1]
-    layers = [256, 128, 64, number_of_classes]
+    layers = [256, 256, 128, 128, 64, 64, number_of_classes]
     # layers = NeuralNetwork.init_layers(
-    #     X=X_train, number_of_hidden_layers=1, output_width=number_of_classes
+    #     X=X_train, number_of_hidden_layers=8, output_width=number_of_classes
     # )
     
     cfg = NeuralNetwork.TrainDefaults()
 
     # limit = 101
-    cfg.step = 10
-    cfg.epochs = 120
+    cfg.step = 1
+    cfg.epochs = 500
     cfg.batch_size = 512
     cfg.learning_rate = 0.001
     cfg.l2_lambda = 0.3
@@ -2313,12 +2982,12 @@ if __name__ == "__main__":
         number_of_features,
         number_of_classes,
         layers,
-        loss_type=NeuralNetwork.LossType.MULTI_CLASS_CROSS_ENTROPY,
-        output_activation_type=NeuralNetwork.OutputActivationType.SOFTMAX,
-        hidden_activation_type=NeuralNetwork.HiddenActivationType.TANH,
+        loss_type=NeuralNetwork.LossType.BINARY_CROSS_ENTROPY,
+        output_activation_type=NeuralNetwork.OutputActivationType.SIGMOID,
+        hidden_activation_type=NeuralNetwork.HiddenActivationType.RELU,
         device=NeuralNetwork.Device.GPU,
-        hidden_weight_init_strategy=NeuralNetwork.WeightInitStrategy.HE_UNIFORM,
-        output_weight_init_strategy=NeuralNetwork.WeightInitStrategy.XAVIER_UNIFORM,
+        hidden_weight_init_strategy=NeuralNetwork.WeightInitStrategy.HE_NORMAL,
+        output_weight_init_strategy=NeuralNetwork.WeightInitStrategy.XAVIER_NORMAL,
         bias_init_strategy=NeuralNetwork.BiasInitStrategy.ZERO,
         config=cfg,
     )
@@ -2340,6 +3009,9 @@ if __name__ == "__main__":
     # Y_valid = Y_valid[:limit]
     # X_test = X_test[:limit]
     # Y_test = Y_test[:limit]
+    
+    sample_x = X_test[2:3]
+    sample_y = Y_test[2:3]
 
     results = model.train(
         X_train,
@@ -2357,14 +3029,19 @@ if __name__ == "__main__":
         finalize=True,
         l2=False,
         dropout=False,
-        graph=False,
-        synch=False,
-        real_time_tracking=False,
+        graph=True,
+        synch=True,
+        real_time_tracking=True,
         _log_predictions=False,
         error_analysis=False,
         _log_confusion_matrix=False,
         _log_error_analysis=False,
         optimizer_type=NeuralNetwork.Optimizers.ADAM,
+        contribution_sample=None,
+        contribution_label=sample_y,
+        contribution_every=10,
+        contribution_input_shape=(28, 28),
+        contribution_use_true_label=True,
     )
 
     model_name = "trained_model_digit_recognizer"

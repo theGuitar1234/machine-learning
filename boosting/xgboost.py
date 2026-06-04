@@ -155,7 +155,7 @@ class XGBoost:
             tree.l2 = self.config.l2
             tree.gamma = self.config.gamma
             tree.batch_size = self.config.batch_size
-            tree.max_xgboost_bins = self.max_xgboost_bins
+            tree.max_xgboost_bins = self.config.max_xgboost_bins
 
             pseudo_residual = -self.dloss(y, self.F_x)
             match self.loss_type:
