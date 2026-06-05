@@ -83,6 +83,8 @@ class CatBoost:
         self.one_hot_features = []
         self.ctr_features = []
         self.one_hot_categories = {}
+        self.ctr_statistics = {}
+        self.combo_ctr_statistics = {}
         self.encoding_target = encoding_target
         self.boosting_type = boosting_type
         self.symmetrical = symmetrical
@@ -99,9 +101,9 @@ class CatBoost:
         self.feature_indices = []
         self.encoding_statistics = []
 
-        # X_model = self._feature_transformer(X, y)
-        # self.X_train_ = X_model
-        # X = X_model
+        X_model = self._feature_transformer(X, y)
+        self.X_train_ = X_model
+        X = X_model
         
         number_of_samples = X.shape[0]
         number_of_features = X.shape[1]
@@ -268,7 +270,7 @@ class CatBoost:
             y_sub_original = y[indices]
             
             # Deprecated - obselete after feature transformer
-            local_categorical_features = self._local_categorical_features(self, feature_indices)
+            local_categorical_features = self._local_categorical_features(feature_indices)
             tree.categorical_features = local_categorical_features
             
             if self.symmetrical:
@@ -348,6 +350,7 @@ class CatBoost:
     
     def _feature_transformer(self, X, y):
         self.numeric_features = []
+
         for feature in range(X.shape[1]):
             if feature not in self.categorical_features:
                 self.numeric_features.append(feature)
@@ -356,35 +359,108 @@ class CatBoost:
         self.preprocess_categorical_combinations()
         return self._transform_features(X, y, training_mode=True)
     
-    # def _transform_features(self, X, y=None, training_mode=False):
-    #     columns = []
+    def _transform_features(self, X, y=None, training_mode=False):
+        columns = []
         
-    #     for numeric_feature in self.numeric_features:
-    #         columns.append(X[:, numeric_feature])
-    #     for one_hot_feature in self.one_hot_features:
-    #         columns.append(X[:, one_hot_feature] == one_hot_feature)
-    #     if training_mode:
-    #         for ctr_feature in self.ctr_features:
-    #             encoded_col, ctr_stats = self._fit_ordered_ctr(X[:, ctr_feature], y)
-    #             self.ctr_statistics = ctr_stats
-    #             columns.append(encoded_col)
-    #         for combo in self.categorical_combinations:
-    #             columns.append(combo)
-    #     else:
-            
-    #     return np.column_stack(columns).astype(float)
+        for numeric_feature in self.numeric_features:
+            columns.append(X[:, numeric_feature].astype(float))
+        for one_hot_column in self._transform_one_hot(X):
+            columns.append(one_hot_column)
+        if training_mode:
+            self.ctr_statistics = {}
+            self.combo_ctr_statistics = {}
+            for ctr_feature in self.ctr_features:
+                keys = X[:, ctr_feature]
+                encoded_col, ctr_stats = self._fit_ordered_ctr(keys, y)
+                self.ctr_statistics[ctr_feature] = ctr_stats
+                columns.append(encoded_col)
+            for combo in self.categorical_combinations:
+                keys = self._generate_combo_keys(X, combo)
+                encoded_col, combo_stats = self._fit_ordered_ctr(keys, y)
+                self.combo_ctr_statistics[combo] = combo_stats
+                columns.append(encoded_col)
+        else:
+            for ctr_feature in self.ctr_features:
+                keys = X[:, ctr_feature]
+                stats = self.ctr_statistics[ctr_feature]
+                encoded_col = self._transform_ctr(keys, stats)
+                columns.append(encoded_col)
+        return np.column_stack(columns).astype(float)
     
+    def _fit_ordered_ctr(self, keys, y):
+        keys = np.asarray(keys, dtype=object)
+        encoded = np.empty(len(keys), dtype=float)
+
+        counts = {}
+        sums = {}
+        prior = float(np.mean(y))
+        prior_weight = self.config.smoothing_strength
+        
+        permutation = self.rng.permutation(len(keys))
+        
+        for row in permutation:
+            key = keys[row]
+            previous_count = counts.get(key, 0)
+            previous_sum = sums.get(key, 0.0)
+            
+            encoded[row] = (
+                previous_sum + prior_weight * prior
+            ) / (
+                previous_count + prior_weight
+            )
+            counts[key] = previous_count + 1
+            sums[key] = previous_sum + y[row]
+        stats = {
+            "counts": counts,
+            "sums": sums,
+            "prior": prior,
+            "prior_weight": prior_weight,
+        }
+        return encoded, stats
+    
+    def _transform_ctr(self, keys, stats):
+        keys = np.asarray(keys, dtype=object)
+        output = np.empty(len(keys), dtype=float)
+        
+        counts = stats["counts"]
+        sums = stats["sums"]
+        prior = stats["prior"]
+        prior_weight = stats["prior_weight"]
+
+        for row in range(len(keys)):
+            key = keys[row]
+            
+            previous_count = counts.get(key, 0)
+            previous_sum = sums.get(key, 0.0)
+            
+            output[row] = (
+                previous_sum + prior_weight * prior
+            ) / (
+                previous_count + prior_weight
+            )
+        return output
+    
+    def _generate_combo_keys(self, X, combo):
+        return np.array(
+            [tuple(row) for row in X[:, combo]],
+            dtype=object,
+        )
+
     def preprocess_categorical_combinations(self):
         self.categorical_combinations = []
-        pairs = list(combinations(self.ctr_features, 2))
-        if len(pairs) > self.config.max_number_of_combos:
+        all_combos = []
+
+        max_ctr_complexity = self.config.max_ctr_complexity
+        for size in range(2, max_ctr_complexity + 1):
+            all_combos.extend(combinations(self.ctr_features, size))
+        if len(all_combos) > self.config.max_number_of_combos:
             chosen_indices = self.rng.choice(
-                len(pairs),
+                len(all_combos),
                 size=self.config.max_number_of_combos,
                 replace=False, 
             )
-            pairs = [pairs[i] for i in chosen_indices]
-        self.categorical_combinations = pairs
+            all_combos = [all_combos[i] for i in chosen_indices]
+        self.categorical_combinations = all_combos
     
     def preprocess_categorical_features(self, X):
         self.one_hot_features = []
@@ -492,10 +568,10 @@ class CatBoost:
     def predict(self, X):
         if self.F_0x is None:
             raise RuntimeError("Model is not fit")
-        # X_model = self._transform_features(X)
+        X_model = self._transform_features(X, training_mode=False)
         prediction = np.repeat(self.F_0x, X.shape[0])
         for tree, feature_indices in zip(self.trees, self.feature_indices):
-            prediction += self.learning_rate * tree.predict(X[:, feature_indices])
+            prediction += self.learning_rate * tree.predict(X_model[:, feature_indices])
         return prediction
     
     def visualize(self):
@@ -747,6 +823,6 @@ if __name__ == "__main__":
         symmetrical=False,
         boosting_type=CatBoost.BoostingType.ORDERED,
     )
-    catboost.fit(X, y, None, None)
+    catboost.fit_ordered(X, y, None, None)
     
     catboost.visualize()
