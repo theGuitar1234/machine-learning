@@ -47,12 +47,14 @@ class ANonSeriousRandomForest:
         minimum_gain=0.05,
         categorical=False,
         adjacent=False,
-        information_gain=None,
         _bootstrap=True,
+        real_time_tracking=False,
+        information_gain=None,
         random_criterion=None,
         forest_type=None,
         voting=Voting.HARD,
         error=Error.MSE,
+        step=10,
     ):
         self.X_train_ = None
         self.y_train_ = None
@@ -69,8 +71,13 @@ class ANonSeriousRandomForest:
         self.forest_type = forest_type
         self.voting = voting
         self.error = error
+        self.real_time_tracking = real_time_tracking
+        self.step = step
+        self.isBound = False
 
-    def fit(self, X, y, verbose=False):
+    def fit(self, X, y, verbose=False, feature1=None, feature2=None):
+        self.isBound = False
+
         self.X_train_ = X
         self.y_train_ = y
         self.trees = []
@@ -113,7 +120,7 @@ class ANonSeriousRandomForest:
                 tree.fit(X_bootstrap, y_bootstrap)
             else:
                 tree.fit(X, y)
-
+            
             self.trees.append(tree)
             depths.append(tree.depth())
             nodes.append(tree.count_nodes())
@@ -128,6 +135,9 @@ class ANonSeriousRandomForest:
                     raise ValueError(
                         f"Unsupported {self.forest_type}, supported values are {list(self.ForestType)}"
                     )
+            if i % self.step == 0:
+                if self.real_time_tracking:
+                    self.visualize_real_time(feature1=feature1, feature2=feature2, epochs=i, cmap="viridis")
         if verbose:
             match self.forest_type:
                 case self.ForestType.CLASSIFICATION:
@@ -144,7 +154,7 @@ class ANonSeriousRandomForest:
     - Mean number of leaves          : {np.array(leaves).mean()}""")
             match self.forest_type:
                 case self.ForestType.CLASSIFICATION:
-                    print(f"Mean Accuracy : {accuracies}")
+                    print(f"Mean Accuracy : {np.mean(accuracies)}")
                     print(f"Accuracy of the forest on td   : {forest_accuracy}")
                 case self.ForestType.REGRESSION:
                     print(f"Regression Metrics {metrics}")
@@ -296,6 +306,7 @@ class ANonSeriousRandomForest:
         return 1 - ss_res / ss_total
 
     def visualize_tree(self, feature1, feature2, cmap=plt.cm.Set1):
+        plt.ioff()
         os.makedirs("img", exist_ok=True)
 
         X_train = self.X_train_[:, [feature1, feature2]]
@@ -334,3 +345,28 @@ class ANonSeriousRandomForest:
         plt.pcolormesh(XX, YY, Z, cmap=cmap, shading="auto")
         plt.savefig("img/bassins_rndm_frst.png")
         plt.show()
+    
+    def visualize_real_time(self, feature1, feature2, epochs, cmap=plt.cm.Set1):
+        plt.ion()
+        X_train = self.X_train_[:, [feature1, feature2]]
+        y_train = self.y_train_
+
+        x_min, x_max = X_train[:, 0].min(), X_train[:, 0].max()
+        y_min, y_max = X_train[:, 1].min(), X_train[:, 1].max()
+
+        X = np.linspace(x_min, x_max, 100)
+        Y = np.linspace(y_min, y_max, 100)
+        XX, YY = np.meshgrid(X, Y)
+
+        baseline = self.X_train_.mean(axis=0)
+        grid_points = np.tile(baseline, (XX.ravel().shape[0], 1))
+
+        # grid_points = np.c_[XX.ravel(), YY.ravel()]
+        grid_points[:, feature1] = XX.ravel()
+        grid_points[:, feature2] = YY.ravel()
+
+        Z = self.predict(grid_points).reshape(XX.shape)
+    
+        plt.title(f"Forest Spliting of the instance Space, epochs : {epochs}")
+        plt.pcolormesh(XX, YY, Z, cmap=cmap, shading="auto")
+        plt.pause(0.05)

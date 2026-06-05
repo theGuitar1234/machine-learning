@@ -190,7 +190,7 @@ if __name__ == "__main__":
     # 20% validation
     # 20% test
 
-    configs = ANonSeriousDecisionTree.generate_config(max_depth=10)
+    # configs = ANonSeriousDecisionTree.generate_config(max_depth=10)
 
     # final_tree = ANonSeriousDecisionTree.choose_best_cross_validation(
     #     X_train_val, y_train_val, configs, log=True, verbose=False
@@ -263,13 +263,21 @@ if __name__ == "__main__":
         _bootstrap=False,
         forest_type=ANonSeriousRandomForest.ForestType.CLASSIFICATION,
         voting=ANonSeriousRandomForest.Voting.SOFT,
-        max_depth=15,
-        number_of_trees=500,
+        max_depth=10,
+        number_of_trees=15,
+        real_time_tracking=True,
+        step=5
     )
 
     # print("\nFitting the Random Forest...")
     # limit = 5
-    random_forest.fit(X_train, y_train, verbose=True)
+    random_forest.fit(
+        X_train, 
+        y_train, 
+        verbose=True, 
+        feature1=feature1, 
+        feature2=feature2,
+    )
 
     # if random_forest.forest_type is ANonSeriousRandomForest.ForestType.CLASSIFICATION:
     #     _, forest_accuracy = random_forest.evaluate_random_forest(X_test, y_test)
@@ -285,7 +293,7 @@ if __name__ == "__main__":
     # # print("\nOOB Evaluation : ")
     # # random_forest.oob_evaluation(verbose=True)
 
-    random_forest.visualize_tree(feature1, feature2)
+    # random_forest.visualize_tree(feature1, feature2)
 
     # X_train_, _ = circle_of_clouds(1, 100, sigma=0.2)  # a cloud
     # X_train_[0] = [-1, 0]  # an outlier

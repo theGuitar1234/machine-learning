@@ -350,6 +350,9 @@ class XGBoost:
     def predict_class(self, X):
         threshold = self.config.threshold
         return (self.predict_proba(X) >= threshold).astype(int)
+    
+    def shap(self):
+        pass
 
     def visualize(self):
         if self.X_train_ is None or self.y_train_ is None:
