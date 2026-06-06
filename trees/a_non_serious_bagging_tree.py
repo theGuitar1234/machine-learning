@@ -146,7 +146,7 @@ class ANonSeriousBaggingTrees:
         return np.array(final_predictions)
 
     def visualize_tree(self, feature1, feature2, cmap=plt.cm.Set1):
-        os.makedirs("img", exist_ok=True)
+        os.makedirs("trees/img", exist_ok=True)
 
         X_train = self.X_train_[:, [feature1, feature2]]
         y_train = self.y_train_
@@ -171,16 +171,16 @@ class ANonSeriousBaggingTrees:
         plt.scatter(
             X_train[:, 0], X_train[:, 1], c=y_train, cmap=cmap, edgecolors="black"
         )
-        plt.savefig("img/frst_scatter.png")
+        plt.savefig("trees/img/frst_scatter.png")
         plt.show()
 
         plt.title("Bagging Contour plot of the splits")
         levels = np.arange(len(self.classes_) + 1) - 0.5
         plt.contourf(XX, YY, Z, levels=levels, alpha=0.3, cmap=cmap)
-        plt.savefig("img/bggng_contour.png")
+        plt.savefig("trees/img/bggng_contour.png")
         plt.show()
 
         plt.title("Bagging Spliting of the instance Space")
         plt.pcolormesh(XX, YY, Z, cmap=cmap, shading="auto")
-        plt.savefig("img/bassins_bggng_trs.png")
+        plt.savefig("trees/img/bassins_bggng_trs.png")
         plt.show()

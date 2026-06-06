@@ -155,7 +155,7 @@ class ANonSeriousRandomForest:
             match self.forest_type:
                 case self.ForestType.CLASSIFICATION:
                     print(f"Mean Accuracy : {np.mean(accuracies)}")
-                    print(f"Accuracy of the forest on td   : {forest_accuracy}")
+                    print(f"Accuracy of the forest on test data          : {forest_accuracy}")
                 case self.ForestType.REGRESSION:
                     print(f"Regression Metrics {metrics}")
                     print(f"Evaluation {evaluation}")
@@ -305,9 +305,9 @@ class ANonSeriousRandomForest:
             return 0
         return 1 - ss_res / ss_total
 
-    def visualize_tree(self, feature1, feature2, cmap=plt.cm.Set1):
+    def visualize_tree(self, feature1, feature2, cmap="viridis"):
         plt.ioff()
-        os.makedirs("img", exist_ok=True)
+        os.makedirs("trees/img", exist_ok=True)
 
         X_train = self.X_train_[:, [feature1, feature2]]
         y_train = self.y_train_
@@ -328,26 +328,33 @@ class ANonSeriousRandomForest:
 
         Z = self.predict(grid_points).reshape(XX.shape)
 
-        plt.title("Forest Scatter Plot of features and true labels")
-        plt.scatter(
-            X_train[:, 0], X_train[:, 1], c=y_train, cmap=cmap, edgecolors="black"
-        )
-        plt.savefig("img/frst_scatter.png")
-        plt.show()
+        self.visualize_dataset(feature1, feature2)
 
         plt.title("Forest Contour plot of the splits")
         levels = np.arange(len(self.classes_) + 1) - 0.5
         plt.contourf(XX, YY, Z, levels=levels, alpha=0.3, cmap=cmap)
-        plt.savefig("img/frst_contour.png")
+        plt.savefig("trees/img/frst_contour.png")
         plt.show()
 
         plt.title("Forest Spliting of the instance Space")
         plt.pcolormesh(XX, YY, Z, cmap=cmap, shading="auto")
-        plt.savefig("img/bassins_rndm_frst.png")
+        plt.savefig("trees/img/bassins_rndm_frst.png")
         plt.show()
     
-    def visualize_real_time(self, feature1, feature2, epochs, cmap=plt.cm.Set1):
+    def visualize_dataset(self, feature1, feature2, cmap="viridis"):
+        X_train = self.X_train_[:, [feature1, feature2]]
+        y_train = self.y_train_
+
+        plt.title("Forest Scatter Plot of features and true labels")
+        plt.scatter(
+            X_train[:, 0], X_train[:, 1], c=y_train, cmap=cmap, edgecolors="black"
+        )
+        plt.savefig("trees/img/frst_scatter.png")
+        plt.show()
+    
+    def visualize_real_time(self, feature1, feature2, epochs, cmap="viridis"):
         plt.ion()
+        
         X_train = self.X_train_[:, [feature1, feature2]]
         y_train = self.y_train_
 
@@ -369,4 +376,7 @@ class ANonSeriousRandomForest:
     
         plt.title(f"Forest Spliting of the instance Space, epochs : {epochs}")
         plt.pcolormesh(XX, YY, Z, cmap=cmap, shading="auto")
+        plt.scatter(
+            X_train[:, 0], X_train[:, 1], c=y_train, cmap=cmap, edgecolors="black"
+        )
         plt.pause(0.05)

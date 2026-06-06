@@ -233,7 +233,7 @@ class GradientBoosting:
         plt.ylabel("Predicted y")
         plt.title("Actual vs Predicted")
         plt.grid(True)
-        plt.savefig("img/prdctns.png")
+        plt.savefig("boosting/img/prdctns.png")
         plt.show()
         
         residuals = y - y_pred
@@ -246,7 +246,7 @@ class GradientBoosting:
         plt.ylabel("Residual: y - prediction")
         plt.title("Residual Plot")
         plt.grid(True)
-        plt.savefig("img/rsdl.png")
+        plt.savefig("boosting/img/rsdl.png")
         plt.show()
         
         losses = []
@@ -268,7 +268,7 @@ class GradientBoosting:
         plt.ylabel("Training MSE")
         plt.title("Training Loss Over Boosting Rounds")
         plt.grid(True)
-        plt.savefig("img/lsss.png")
+        plt.savefig("boosting/img/lsss.png")
         plt.show()
         
         x1_min, x1_max = X[:, 0].min(), X[:, 0].max()
@@ -294,7 +294,7 @@ class GradientBoosting:
         plt.ylabel("Feature 2")
         plt.title("Gradient Boosting Prediction Surface")
         plt.grid(True)
-        plt.savefig("img/prdctn_srfc.png")
+        plt.savefig("boosting/img/prdctn_srfc.png")
         plt.show()
         
         fig = plt.figure(figsize=(9, 7))
@@ -308,7 +308,7 @@ class GradientBoosting:
         ax.set_zlabel("Target / Prediction")
         ax.set_title("Learned Regression Surface")
         
-        plt.savefig("img/3d_srfc.png")
+        plt.savefig("boosting/img/3d_srfc.png")
         plt.show()
 
 if __name__ == "__main__":

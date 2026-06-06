@@ -183,7 +183,7 @@ class ANonSeriousIsolationRandomForest:
         fig.colorbar(mesh, ax=axes[1], label="average path length")
 
         plt.tight_layout()
-        plt.savefig("img/sltn_random_forest.png")
+        plt.savefig("trees/img/sltn_random_forest.png")
         plt.show()
 
     def _baseline_row(self):

@@ -82,7 +82,7 @@ if __name__ == "__main__":
 
             points = np.column_stack([x, y])
 
-            # points += rng.normal(scale=sigma, size=points.shape)
+            points += rng.normal(scale=sigma, size=points.shape)
 
             return points
 
@@ -121,7 +121,7 @@ if __name__ == "__main__":
 
             points = np.column_stack([x, y])
 
-            # points += rng.normal(scale=sigma, size=points.shape)
+            points += rng.normal(scale=sigma, size=points.shape)
 
             return points
 
@@ -136,8 +136,8 @@ if __name__ == "__main__":
 
         return X, y
         
-    # dataset = datasets.load_iris()
-    seed = np.random.randint(0, 100)
+    dataset = datasets.load_iris()
+    seed = 42
 
     # X, y = circle_of_clouds(10, 30, seed=seed)
     # X, y = logarithmic_spirals(
@@ -148,20 +148,20 @@ if __name__ == "__main__":
     #     sigma=0.04,
     #     seed=42
     # )
-    X, y = spiral_of_clouds(
-        n_objects_by_class=150,
-        radius=5,
-        n_turns=3,
-        sigma=0.08,
-        seed=42,
-        b=0.12
-    )
-    feature1 = 0
-    feature2 = 1
+    # X, y = spiral_of_clouds(
+    #     n_objects_by_class=150,
+    #     radius=5,
+    #     n_turns=3,
+    #     sigma=0.08,
+    #     seed=42,
+    #     b=0.12
+    # )
+    feature1 = 2
+    feature2 = 3
 
-    # X = dataset.data[:, [feature1, feature2]]
-    # X = dataset.data
-    # y = dataset.target
+    X = dataset.data[:, [feature1, feature2]]
+    X = dataset.data
+    y = dataset.target
 
     # X, y = make_regression(
     #     n_samples=300,
@@ -263,8 +263,8 @@ if __name__ == "__main__":
         _bootstrap=False,
         forest_type=ANonSeriousRandomForest.ForestType.CLASSIFICATION,
         voting=ANonSeriousRandomForest.Voting.SOFT,
-        max_depth=10,
-        number_of_trees=15,
+        max_depth=15,
+        number_of_trees=50,
         real_time_tracking=True,
         step=5
     )
@@ -293,7 +293,7 @@ if __name__ == "__main__":
     # # print("\nOOB Evaluation : ")
     # # random_forest.oob_evaluation(verbose=True)
 
-    # random_forest.visualize_tree(feature1, feature2)
+    random_forest.visualize_tree(feature1, feature2)
 
     # X_train_, _ = circle_of_clouds(1, 100, sigma=0.2)  # a cloud
     # X_train_[0] = [-1, 0]  # an outlier

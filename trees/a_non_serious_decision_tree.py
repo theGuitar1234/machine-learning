@@ -2014,9 +2014,9 @@ class ANonSeriousDecisionTree:
         plt.ylabel("Values")
         plt.barh(features, values)
 
-        os.makedirs("img", exist_ok=True)
+        os.makedirs("trees/img", exist_ok=True)
 
-        plt.savefig("img/ftr_mprtncs.png")
+        plt.savefig("trees/img/ftr_mprtncs.png")
         plt.show()
 
     def permutation_importance(
@@ -2120,9 +2120,9 @@ class ANonSeriousDecisionTree:
 
             plt.tight_layout(rect=[0, 0, 1, 0.95])
 
-            os.makedirs("img", exist_ok=True)
+            os.makedirs("trees/img", exist_ok=True)
 
-            plt.savefig("img/prmttn_mprtncs.png")
+            plt.savefig("trees/img/prmttn_mprtncs.png")
             plt.show()
         return (
             permutation_importance_averages,
@@ -2130,7 +2130,7 @@ class ANonSeriousDecisionTree:
         )
 
     def visualize_tree(self, feature1, feature2, cmap=plt.cm.Set1):
-        os.makedirs("img", exist_ok=True)
+        os.makedirs("trees/img", exist_ok=True)
 
         X_train = self.X_train_[:, [feature1, feature2]]
         y_train = self.y_train_
@@ -2155,18 +2155,18 @@ class ANonSeriousDecisionTree:
         plt.scatter(
             X_train[:, 0], X_train[:, 1], c=y_train, cmap=cmap, edgecolors="black"
         )
-        plt.savefig("img/scatter.png")
+        plt.savefig("trees/img/scatter.png")
         plt.show()
 
         plt.title("Contour plot of the splits")
         levels = np.arange(len(self.classes_) + 1) - 0.5
         plt.contourf(XX, YY, Z, levels=levels, alpha=0.3, cmap=cmap)
-        plt.savefig("img/contour.png")
+        plt.savefig("trees/img/contour.png")
         plt.show()
 
         plt.title("Spliting of the instance Space")
         plt.pcolormesh(XX, YY, Z, cmap=cmap, shading="auto")
-        plt.savefig("img/bassins.png")
+        plt.savefig("trees/img/bassins.png")
         plt.show()
 
     def export_text(self, node, feature_names=None, class_names=None, text=""):

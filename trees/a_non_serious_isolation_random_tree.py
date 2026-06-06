@@ -278,5 +278,5 @@ class ANonSeriousIsolationRandomTree:
             axes[i % 3, i // 3].set_title(
                 f"Bassins of the isolation tree for seed={i}", fontsize=6
             )
-        plt.savefig("img/sltn_bassins.png")
+        plt.savefig("trees/img/sltn_bassins.png")
         plt.show()

@@ -574,6 +574,135 @@ class CatBoost:
             prediction += self.learning_rate * tree.predict(X_model[:, feature_indices])
         return prediction
     
+    def permutation_importance(
+        self,
+        X,
+        y,
+        feature_names=None,
+        n_repeats=50,
+        verbose=False,
+    ):
+        _, baseline_loss = self.evaluate_dataset(X, y)
+        rng = self.rng
+        
+        permutation_importance_averages = {}
+        permutation_importance_standart_deviations = {}
+        
+        for feature in range(X.shape[1]):
+            drop_losses = []
+            
+            for _ in range(n_repeats):
+                X_shuffled = X.copy()
+                rng.shuffle(X_shuffled[:, feature])
+                _, drop_loss = self.evaluate_dataset(X_shuffled, y)
+                drop_losses.append(baseline_loss - drop_loss)
+            feature_name = (
+                feature_names[feature]
+                if feature_names is not None
+                else f"feature{feature}"
+            )
+            permutation_importance_averages[f"{feature_name}_avg"] = np.average(drop_losses)
+            permutation_importance_standart_deviations[f"{feature_name}_std"] = np.std(drop_losses)
+        if verbose:
+            features_avg = list(permutation_importance_averages.keys())
+            features_std = [feature.replace("_avg", "_std") for feature in features_avg]
+            feature_labels = [feature.replace("_avg", "") for feature in features_avg]
+            avg_values = np.array(
+                [
+                    float(
+                        np.asarray(
+                            permutation_importance_averages[feature], dtype=float
+                        ).mean()
+                    )
+                    for feature in features_avg
+                ],
+                dtype=float,
+            )
+            std_values = np.array(
+                [
+                    float(
+                        np.asarray(
+                            permutation_importance_standart_deviations[feature],
+                            dtype=float,
+                        ).mean()
+                    )
+                    for feature in features_std
+                ],
+                dtype=float,
+            )
+            total_avg = np.sum(avg_values)
+            total_std = np.sum(std_values)
+            values_avg = (
+                (avg_values / total_avg) * 100
+                if total_avg != 0
+                else np.zeros_like(avg_values)
+            )
+            values_std = (
+                (std_values / total_std) * 100
+                if total_std != 0
+                else np.zeros_like(std_values)
+            )
+            self.verbose_permutation_importance(
+                permutation_importance_averages,
+                permutation_importance_standart_deviations,
+                std_values,
+                values_std,
+                avg_values,
+                values_avg,
+            )
+            self.visualize_permutation_importance(
+                feature_labels,
+                values_avg,
+                values_std,
+            )
+        return permutation_importance_averages, permutation_importance_standart_deviations
+            
+    def verbose_permutation_importance(
+        self,
+        permutation_importance_averages,
+        permutation_importance_standart_deviations,
+        std_values,
+        values_std,
+        avg_values,
+        values_avg,
+    ):
+        print("\nPermutation Importances : ")
+        for key_avg, value_avg in permutation_importance_averages.items():
+            print(f"feature : {key_avg}, importance is {value_avg}")
+        print()
+        for key_std, value_std in permutation_importance_standart_deviations.items():
+            print(f"feature: {key_std}, standart deviation is {value_std}")
+        print("\nstd_values:", std_values)
+        print("values_std:", values_std)
+        print("\navg_values:", avg_values)
+        print("values_avg", values_avg)
+
+    def visualize_permutation_importance(
+        self,
+        feature_labels,
+        values_avg,
+        values_std,
+    ):
+        fig, axes = plt.subplots(1, 2, figsize=(10, 6))
+        fig.suptitle("Permutation Importances")
+
+        axes[0].barh(feature_labels, values_avg)
+        axes[0].set_xlabel("Percentage")
+        axes[0].set_ylabel("Features")
+        axes[0].set_title("Average Importance")
+
+        axes[1].barh(feature_labels, values_std)
+        axes[1].set_xlabel("Percentage")
+        axes[1].set_ylabel("Features")
+        axes[1].set_title("Std Importance")
+
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+
+        os.makedirs("boosting/img", exist_ok=True)
+
+        plt.savefig("boosting/img/prmttn_mprtncs.png")
+        plt.show()    
+    
     def visualize(self):
         if self.X_train_ is None or self.y_train_ is None:
             raise RuntimeError("Model is not fit")
@@ -821,8 +950,10 @@ if __name__ == "__main__":
         sub_sample=1,
         column_sub_sample=1,
         symmetrical=False,
-        boosting_type=CatBoost.BoostingType.ORDERED,
+        boosting_type=CatBoost.BoostingType.PLAIN,
     )
     catboost.fit_ordered(X, y, None, None)
     
     catboost.visualize()
+    
+    catboost.permutation_importance(X, y, verbose=True)
