@@ -13,6 +13,10 @@ import os
 from trees import ANonSeriousDecisionTree
 from trees import ANonSeriousSymmetricalTree
 
+import math
+
+from trees.a_non_serious_path_element import ANonSeriousPathElement
+
 
 class CatBoost:
     
@@ -85,6 +89,7 @@ class CatBoost:
         self.one_hot_categories = {}
         self.ctr_statistics = {}
         self.combo_ctr_statistics = {}
+        self.coalition_values = {}
         self.encoding_target = encoding_target
         self.boosting_type = boosting_type
         self.symmetrical = symmetrical
@@ -385,6 +390,11 @@ class CatBoost:
                 stats = self.ctr_statistics[ctr_feature]
                 encoded_col = self._transform_ctr(keys, stats)
                 columns.append(encoded_col)
+            for combo in self.categorical_combinations:
+                keys = self._generate_combo_keys(X, combo)
+                stats = self.combo_ctr_statistics[combo]
+                encoded_col = self._transform_ctr(keys, stats)
+                columns.append(encoded_col)
         return np.column_stack(columns).astype(float)
     
     def _fit_ordered_ctr(self, keys, y):
@@ -574,6 +584,410 @@ class CatBoost:
             prediction += self.learning_rate * tree.predict(X_model[:, feature_indices])
         return prediction
     
+    def agnostic_shapley(
+        self, 
+        X, 
+        background_X, 
+        verbose=False, 
+        # optimized=False
+    ):
+        if self.F_0x is None:
+            raise RuntimeError("Model is not fit.")
+        M = X.shape[1]
+        # features = np.arange(M)
+        
+        self.compute_coalition_values(X, background_X, M)
+        v_empty = self.coalition_values[0]
+        # v_empty = self._condition_value(background_X)
+        phi_0 = v_empty
+        
+        phi = np.zeros(M, dtype=float)
+        # for j in features:
+        for j in range(M):
+            shapley_value = self._shapley_value(M, j)                
+            # shapley_value = self._shapley_value(X, S, features, j)
+            phi[j] = shapley_value
+        prediction = self.predict(X)
+        reconstructed = phi_0 + np.sum(phi)
+        additivity_error = abs(prediction - reconstructed)
+        
+        if verbose:
+            print("\nShapley Additive Explanations: ")
+            print(f"""
+    phi_0:            {phi_0},
+    phi:              {phi},
+    prediction:       {prediction},
+    reconstructed:    {reconstructed},
+    additivity_error: {additivity_error}
+    """)
+
+        return {
+            "phi_0": phi_0,
+            "phi": phi,
+            "prediction": prediction,
+            "reconstructed": reconstructed,
+            "additivity_error": additivity_error
+        }
+    
+    def sampling_shapley(
+        self, 
+        X, 
+        background_X, 
+        number_of_permutations=100,
+        verbose=False,
+    ):
+        if self.F_0x is None:
+            raise RuntimeError("Model is not fit.")
+        M = X.shape[1]
+        all_mask = (1 << M) - 1
+        cache = {}
+        def v(mask):
+            if mask not in cache:
+                cache[mask] = self._condition_value(X, background_X, mask)
+            return cache[mask]
+        samples = np.zeros((number_of_permutations, M), dtype=float)
+        phi_0 = v(0)
+
+        for i in range(number_of_permutations):
+            order = self.rng.permutation(M)
+            current_mask = 0
+            previous_value = v(current_mask)
+            for j in order:
+                new_mask = current_mask | (1 << j)
+                new_value = v(new_mask)
+                marginal = new_value - previous_value
+                samples[i, j] = marginal
+                current_mask = new_mask
+                previous_value = new_value
+        phi = np.mean(samples, axis=0)
+        phi_std = np.std(samples, axis=0)
+        
+        prediction = v(all_mask)
+        reconstructed = phi_0 + np.sum(phi)
+        additivity_error = abs(prediction - reconstructed)
+        
+        if verbose:
+            print("\nSampling SHAP Explanations:")
+            print(f"""
+    phi_0:                  {phi_0}
+    phi:                    {phi}
+    phi_std:                {phi_std}
+    prediction:             {prediction}
+    reconstructed:          {reconstructed}
+    additivity_error:       {additivity_error}
+    number_of_permutations: {number_of_permutations}
+    cached_coalitions:      {len(cache)}
+    background_size:        {background_X.shape[0]}
+    """)
+        return {
+            "phi_0": phi_0,
+            "phi": phi,
+            "phi_std": phi_std,
+            "prediction": prediction,
+            "reconstructed": reconstructed,
+            "additivity_error": additivity_error,
+            "number_of_permutations": number_of_permutations,
+            "background_size": background_X.shape[0],
+            "cached_coalitions": len(cache),
+        }
+    
+    def kernel_shapley(
+        self,
+        X,
+        background_X,
+        number_of_samples=100,
+        large_weight=1e6,
+        additivity_correction=False,
+        verbose=False,
+    ):
+        if self.F_0x is None:
+            raise RuntimeError("Model is not fit.")
+        M = X.shape[1]
+        all_mask = (1 << M) - 1
+        cache = {}
+        
+        def v(mask):
+            if mask not in cache:
+                cache[mask] = self._condition_value(X, background_X, mask)
+            return cache[mask]
+        baseline = v(0)
+        prediction = v(all_mask)
+        
+        masks = []
+        targets = []
+        weights = []
+        
+        masks.append(0)
+        targets.append(0.0)
+        weights.append(large_weight)
+        
+        masks.append(all_mask)
+        targets.append(prediction - baseline)
+        weights.append(large_weight)
+        
+        for _ in range(number_of_samples):
+            mask = self._sample_kernel_mask(M)
+            k = mask.bit_count()
+            
+            value = v(mask)
+            adjusted_target = value = baseline
+            weight = self._shap_kernel_weight(M, k)
+            
+            masks.append(mask)
+            targets.append(adjusted_target)
+            weights.append(weight)
+        Z = np.vstack([
+            self._mask_to_binary_vector(mask, M)
+            for mask in masks
+        ])
+        
+        y = np.asarray(targets, dtype=float)
+        w = np.asarray(weights, dtype=float)
+        phi = self._weighted_linear_regression(Z, y, w)
+        
+        reconstructed = baseline + np.sum(phi)
+        additivity_error = abs(prediction - reconstructed)
+        
+        if additivity_correction:
+            phi = self._apply_additivity_correction(
+                phi=phi,
+                baseline=baseline,
+                prediction=prediction,
+            )
+            reconstructed = baseline + np.sum(phi)
+            additivity_error = abs(prediction - reconstructed)
+
+        if verbose:
+            print("\nKernel SHAP Explanations:")
+            print(f"""
+    phi_0:              {baseline}
+    phi:                {phi}
+    prediction:         {prediction}
+    reconstructed:      {reconstructed}
+    additivity_error:   {additivity_error}
+    number_of_samples:  {number_of_samples}
+    cached_coalitions:  {len(cache)}
+    background_size:    {background_X.shape[0]}
+        """)
+
+        return {
+            "phi_0": baseline,
+            "phi": phi,
+            "prediction": prediction,
+            "reconstructed": reconstructed,
+            "additivity_error": additivity_error,
+            "number_of_samples": number_of_samples,
+            "background_size": background_X.shape[0],
+            "cached_coalitions": len(cache),
+            "method": "kernel_shap",
+        }
+    
+    def tree_shapley(self, node, X, path):
+        # extend path with information from parent split
+        if node.is_leaf:
+            # distribute leaf value into phi values using path weights
+            return
+        # decide hot child:
+        #   branch x actually follows
+        # decide cold child:
+        #   opposite branch
+        
+        # compute hot_zero_franction
+        # compute cold_zero_franction
+        
+        # recurse into hot child with one_fraction = 1
+        # recurse into cold child with one_fraction = 0
+
+    # def _shapley_value(self, X, S, features, M, j):
+    #     phi_j = 0
+    #     features_except_j = features[features != j]
+    #     for subset_size in range(len(features_except_j) + 1):
+    #         for S in combinations(features_except_j, subset_size):
+    #             X_S = X[:, S]
+    #             S_with_j = S.append(j)
+    #             X_S_with_j = X[:, S_with_j]
+    #             weight = (
+    #                 math.factorial(len(S)) *
+    #                 math.factorial(M - len(S) - 1)
+    #                 / math.factorial(M)
+    #             )
+    #             contribution = self._condition_value(X_S_with_j, X, S_with_j) - self._condition_value(X_S, X, S)
+    #             phi_j += weight * contribution
+    #     return phi_j
+    
+    def _shapley_value(self, M, j):
+        phi_j = 0.0
+        for mask in range(1 << M): # math.exp(2, M)
+            if mask & (1 << j): # j in mask
+                continue
+            S_size = mask.bit_count() # len(mask_with_j == 1)
+            mask_with_j = mask | (1 << j) # S.append(j)
+            weight = (
+                math.factorial(S_size) * 
+                math.factorial(M - S_size - 1)
+            ) / math.factorial(M)
+            marginal = (
+                self.coalition_values[mask_with_j] - 
+                self.coalition_values[mask]
+            )
+            phi_j += weight * marginal
+        return phi_j
+
+    def _condition_value(self, X_masked, background_X, mask):
+        # if S is not None:
+        #     for feature in S:
+        #         X_masked[:, feature] = X[feature]
+        X_masked = copy.deepcopy(background_X)
+        M = X_masked.shape[1]
+        selected_features = [
+            feature for feature in range(M)
+            if mask & (1 << feature)
+        ]
+        if selected_features:
+            X_masked[:, selected_features] = X[0, selected_features]
+        predictions = self.predict(X_masked)
+        return np.mean(predictions)
+    
+    def compute_coalition_values(self, X, background_X, M):
+        self.coalition_values = {}
+        # for mask in range(0, math.exp(2, M)):
+        #     self.coalition_values[mask] = self._condition_value(X, background_X, mask)
+        for mask in range(1 << M):
+            self.coalition_values[mask] = self._condition_value(
+                X, background_X, mask
+            )
+    
+    def _sample_kernel_mask(self, M):
+        all_mask = (1 << M) - 1
+        while True:
+            mask = int(self.rng.integers(1, all_mask))
+            if mask != 0 and mask != all_mask:
+                return mask
+    
+    def _shap_kernel_weight(self, M, k):
+        if k == 0 or k == M:
+            return 1e6
+        return (M - 1) / (
+            math.comb(M, k) * k * (M - k)
+        )
+    
+    def _mask_to_binary_vector(self, mask, M):
+        return np.array(
+            [
+                1.0 if mask & (1 << feature) else 0.0
+                for feature in range(M)
+            ],
+            dtype=float,
+        )
+    
+    def _weighted_linear_regression(self, Z, y, weights):
+        sqrt_w = np.sqrt(weights)
+        
+        Z_weighted = Z * sqrt_w[:, None]
+        y_weighted = y * sqrt_w
+        
+        phi, *_ = np.linalg.lstsq(
+            Z_weighted,
+            y_weighted,
+            rcond=None,
+        )
+        return phi
+    
+    def _apply_additivity_correction(self, phi, baseline, prediction):
+        reconstructed = baseline + np.sum(phi)
+        difference = prediction - reconstructed
+        total_abs = np.sum(np.abs(phi))
+        if total_abs > 0:
+            return phi + difference * np.abs(phi) / total_abs
+        return phi + difference / len(phi)
+    
+    def _extend_path(path, zero_fraction, one_fraction, feature_index):
+        depth = len(path)
+        pathElement = ANonSeriousPathElement(
+            feature_index=feature_index,
+            zero_fraction=zero_fraction,
+            one_fraction=one_fraction,
+            path_weight=0
+        )
+        path.append(pathElement)
+        if depth == 0:
+            pathElement.path_weight = 1
+        else:
+            for i in range(depth - 1, 0, -1):
+                path[i + 1].path_weight += (
+                    one_fraction *
+                    path[i].path_weight *
+                    (i + 1) /
+                    (depth + 1)
+                )
+                path[i].path_weight = (
+                    zero_fraction *
+                    path[i].path_weight *
+                    (depth - i)
+                    / (depth + 1)
+                )
+        return path
+    
+    def _unwind_path(self):
+        pass
+    
+    def tree_contributions(self, row, top_k=10, verbose=False):
+        if self.F_0x is None:
+            raise RuntimeError("Model is not fit.")
+        row = np.asarray(row)
+        if row.ndim == 1:
+            row = row.reshape(1, -1)
+        if row.ndim != 2:
+            raise ValueError("row must be a 1D row or a 2D array with one row.")
+        if row.shape[0] != 1:
+            raise ValueError("tree_contributions explains one row at a time.")
+        transformed_row = self._transform_features(row, training_mode=False)
+        baseline = self.F_0x
+        running_prediction = baseline
+        tree_explanations = []
+        number_of_trees = self.boosting_rounds
+        for tree_index in range(number_of_trees):
+            tree = self.trees[tree_index]
+            feature_indices = self.feature_indices[tree_index]
+            tree_rows = transformed_row[:, feature_indices]
+            raw_tree_output = tree.predict(tree_rows)
+            contribution = self.learning_rate * raw_tree_output
+            running_prediction = running_prediction + contribution
+            record = {
+                "tree_index": tree_index,
+                "raw_tree_output": raw_tree_output,
+                "contribution": contribution,
+                "absolute_contribution": abs(contribution),
+                "feature_indices": feature_indices,
+                "prediction": running_prediction 
+            }
+            tree_explanations.append(record)
+        sorted_tree_explanations = sorted(
+            tree_explanations,
+            key=lambda record: record["absolute_contribution"],
+            reverse=True,
+        )
+        top_tree_explanations = sorted_tree_explanations[:top_k]
+        
+        if verbose:
+            print(f"""
+    Baseline: {baseline},
+    Final Raw Prediction: {running_prediction},
+    """)
+            for record in top_tree_explanations:
+                print(f"""
+    tree: {record["tree_index"]},
+        raw_tree_output: {record["raw_tree_output"]},
+        contribution: {record["contribution"]},
+        Prediction After Tree: {record["prediction"]}
+    """)
+        return {
+            "baseline": baseline,
+            "final_raw_prediction": running_prediction,
+            "all_tree_explanations": tree_explanations,
+            "top_tree_explanations": top_tree_explanations,
+        }
+
     def permutation_importance(
         self,
         X,
@@ -938,7 +1352,8 @@ if __name__ == "__main__":
     
     from .generate_categories import create_categorical_dataset
 
-    X, y = create_categorical_dataset(n_samples=300, seed=42)
+    seed = 42
+    X, y = create_categorical_dataset(n_samples=300, seed=seed)
     X = np.asarray(X)
     y = np.asarray(y)
 
@@ -954,6 +1369,32 @@ if __name__ == "__main__":
     )
     catboost.fit_ordered(X, y, None, None)
     
-    catboost.visualize()
+    # catboost.visualize()
+    # catboost.permutation_importance(X, y, verbose=True)
     
-    catboost.permutation_importance(X, y, verbose=True)
+    row = X[[0]]
+    rng = np.random.default_rng(seed)
+    background_index = rng.choice(
+        X.shape[0],
+        size=min(20, X.shape[0]),
+        replace=False,
+    )
+    background_X = X[background_index]
+    # result = catboost.agnostic_shapley(
+    #     X=row,
+    #     background_X=background_X,
+    #     verbose=True,
+    # )
+    # sampled_result = catboost.sampling_shapley(
+    #     X=row,
+    #     background_X=background_X,
+    #     number_of_permutations=100,
+    #     verbose=True,
+    # )
+    # kernel_result = catboost.kernel_shapley(
+    #     X=row,
+    #     background_X=background_X,
+    #     number_of_samples=500,
+    #     verbose=True,
+    # )
+    catboost.tree_contributions(row, verbose=True)

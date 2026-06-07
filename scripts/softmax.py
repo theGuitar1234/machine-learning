@@ -1,4 +1,4 @@
-import calculus.logistic_regression_matrixDONE as lrm
+import calculus.logistic_regression_matrix as lrm
 
 def train_one_vs_rest(X, y_multiclass, K, learning_rate, epochs, lrm):
     params = []
