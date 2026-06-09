@@ -1417,16 +1417,6 @@ class NeuralNetwork:
                     self.optimizer(grads, current_lr, optimizer_type, cfg)
 
                 batch_loss = self.loss(Y_batch, A, epsilon)
-                if contribution_sample is not None and epoch % contribution_every == 0:
-                    self.visualize_full_layer_contributions_live(
-                        x_sample=contribution_sample,
-                        y_sample=contribution_label,
-                        target_class=contribution_target_class,
-                        epoch=epoch,
-                        input_shape=contribution_input_shape,
-                        use_true_label_as_target=contribution_use_true_label,
-                        pause=0.01,
-                    )
                 train_data_loss += batch_loss * (end - batch_start)
 
             if self.on_gpu:

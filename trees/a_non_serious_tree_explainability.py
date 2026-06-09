@@ -95,13 +95,6 @@ class ANonSeriousTreeExplainability:
     Model Decision: "predicted" {f"1 because probability >= {threshold}" if false_negative_report["y_hat"] >= threshold else f"0 because probability < {threshold}"}
     """)
         return false_positive_reports, false_negative_reports
-    
-    # def summarize_error_patterns(error_reports):
-    #     feature_error_counts = np.empty()
-    #     feature_error_magnitude = np.empty()
-        
-    #     for report in error_reports:
-    #         for feature, 
 
 
 if __name__ == "__main__":
@@ -124,4 +117,6 @@ if __name__ == "__main__":
     )
 
     tree.fit(X, y, verbose=False)
-    ANonSeriousTreeExplainability.explain_worst_classifications(tree, X, y, verbose=True)
+    
+    reports = ANonSeriousTreeExplainability.explain_worst_regressions(tree, X, y, verbose=False)
+    # ANonSeriousTreeExplainability.explain_worst_classifications(tree, X, y, verbose=True)
