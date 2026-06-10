@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-from numba import njit
+
 import os
 import csv
 import copy
@@ -1709,6 +1709,15 @@ class NeuralNetwork:
     def predict(self, x):
         A, cache, _, _ = self.forward_pass(x, training_mode=False)
         return A, cache
+    
+    def predict_logits(self, X):
+        A = X
+        for l in range(self.L):
+            W, b = self.WB[l]
+            Z = self.linear_model(W, A, b)
+            if l == self.L - 1:
+                return Z
+            A = self.activation(Z)
 
     def error_analysis(
         self,
@@ -2048,14 +2057,14 @@ class NeuralNetwork:
     def load_model(cls, model_path, meta_data_path=None, device=None, meta=False):
         with open(model_path, "rb") as f:
             model = pickle.load(f)
-        print(f"Loaded Model from : {model_path}\n")
+        print(f"\nLoaded Model from : {model_path}\n")
         if device is not None:
             model.move_to(device)
         meta_data = None
         if meta and meta_data_path is not None:
             with open(meta_data_path, "rb") as f:
                 meta_data = pickle.load(f)
-            print(f"Loaded Meta data from : {meta_data_path}\n")
+            print(f"\nLoaded Meta data from : {meta_data_path}\n")
         return model, meta_data
 
     @classmethod
@@ -2299,80 +2308,80 @@ class NeuralNetwork:
 
 
 if __name__ == "__main__":
-    number_of_classes = 1
+
+    number_of_classes = 10
     seed = 42
 
-    # dataset = NeuralNetwork.load_from_npz("data/npz/MNIST.npz")
-    def spiral_of_clouds(
-        n_objects_by_class,
-        radius=5,
-        n_turns=3,
-        sigma=0.12,
-        seed=0,
-        angle=0,
-        b=0.18,
-    ):
-        rng = np.random.default_rng(seed)
+    dataset = NeuralNetwork.load_from_npz("data/npz/MNIST.npz")
 
-        theta = np.linspace(0, 2 * np.pi * n_turns, n_objects_by_class)
+    # def spiral_of_clouds(
+    #     n_objects_by_class,
+    #     radius=5,
+    #     n_turns=3,
+    #     sigma=0.12,
+    #     seed=0,
+    #     angle=0,
+    #     b=0.18,
+    # ):
+    #     rng = np.random.default_rng(seed)
 
-        r = np.exp(b * theta) - 1
-        r = radius * r / r.max()
+    #     theta = np.linspace(0, 2 * np.pi * n_turns, n_objects_by_class)
 
-        def arm(k):
-            t = theta + k * np.pi + angle
+    #     r = np.exp(b * theta) - 1
+    #     r = radius * r / r.max()
 
-            x = r * np.cos(t)
-            y = r * np.sin(t)
+    #     def arm(k):
+    #         t = theta + k * np.pi + angle
 
-            points = np.column_stack([x, y])
-            points += rng.normal(scale=sigma, size=points.shape)
+    #         x = r * np.cos(t)
+    #         y = r * np.sin(t)
 
-            return points
+    #         points = np.column_stack([x, y])
+    #         points += rng.normal(scale=sigma, size=points.shape)
 
-        X0 = arm(0)
-        X1 = arm(1)
+    #         return points
 
-        X = np.vstack([X0, X1]).astype(np.float32)
+    #     X0 = arm(0)
+    #     X1 = arm(1)
 
-        # IMPORTANT:
-        # Binary sigmoid wants shape: (samples, 1), not (samples,)
-        Y = np.array(
-            [0] * n_objects_by_class + [1] * n_objects_by_class, dtype=np.float32
-        ).reshape(-1, 1)
+    #     X = np.vstack([X0, X1]).astype(np.float32)
 
-        return X, Y
+    #     Y = np.array(
+    #         [0] * n_objects_by_class + [1] * n_objects_by_class, dtype=np.float32
+    #     ).reshape(-1, 1)
 
-    X, Y = spiral_of_clouds(
-        n_objects_by_class=1000, radius=5, n_turns=3, sigma=0.08, seed=seed, b=0.12
-    )
+    #     return X, Y
 
-    X_train_val, X_test, Y_train_val, Y_test = train_test_split(
-        X, Y, test_size=0.20, random_state=seed, stratify=Y.ravel()
-    )
+    # X, Y = spiral_of_clouds(
+    #     n_objects_by_class=1000, radius=5, n_turns=3, sigma=0.08, seed=seed, b=0.12
+    # )
 
-    X_train, X_valid, Y_train, Y_valid = train_test_split(
-        X_train_val,
-        Y_train_val,
-        test_size=0.25,
-        random_state=seed,
-        stratify=Y_train_val.ravel(),
-    )
+    # X_train_val, X_test, Y_train_val, Y_test = train_test_split(
+    #     X, Y, test_size=0.20, random_state=seed, stratify=Y.ravel()
+    # )
+
+    # X_train, X_valid, Y_train, Y_valid = train_test_split(
+    #     X_train_val,
+    #     Y_train_val,
+    #     test_size=0.25,
+    #     random_state=seed,
+    #     stratify=Y_train_val.ravel(),
+    # )
 
     # json_dataset = NeuralNetwork.load_from_json('data/json/test.json')
-    # prepared_dataset = dataset
-    # prepared_dataset = NeuralNetwork.prepare_datasets(dataset, number_of_classes)
 
-    # X_train = prepared_dataset["X_train"]
-    # Y_train = prepared_dataset["Y_train"]
-    # X_valid = prepared_dataset["X_valid"]
-    # Y_valid = prepared_dataset["Y_valid"]
-    # X_test = prepared_dataset["X_test"]
-    # Y_test = prepared_dataset["Y_test"]
+    prepared_dataset = NeuralNetwork.prepare_datasets(dataset, number_of_classes)
 
-    # X_train = X_train.astype(np.float32) / 255.0
-    # X_valid = X_valid.astype(np.float32) / 255.0
-    # X_test = X_test.astype(np.float32) / 255.0
+    X_train = prepared_dataset["X_train"]
+    Y_train = prepared_dataset["Y_train"]
+    X_valid = prepared_dataset["X_valid"]
+    Y_valid = prepared_dataset["Y_valid"]
+    X_test = prepared_dataset["X_test"]
+    Y_test = prepared_dataset["Y_test"]
+
+    X_train = X_train.astype(np.float32) / 255.0
+    X_valid = X_valid.astype(np.float32) / 255.0
+    X_test = X_test.astype(np.float32) / 255.0
 
     number_of_features = X_train.shape[1]
     layers = [256, 256, 128, 128, 64, 64, number_of_classes]
@@ -2383,8 +2392,8 @@ if __name__ == "__main__":
     cfg = NeuralNetwork.TrainDefaults()
 
     # limit = 101
-    cfg.step = 1
-    cfg.epochs = 500
+    cfg.step = 10
+    cfg.epochs = 50
     cfg.batch_size = 512
     cfg.learning_rate = 0.001
     cfg.l2_lambda = 0.3
@@ -2394,12 +2403,12 @@ if __name__ == "__main__":
         number_of_features,
         number_of_classes,
         layers,
-        loss_type=NeuralNetwork.LossType.BINARY_CROSS_ENTROPY,
-        output_activation_type=NeuralNetwork.OutputActivationType.SIGMOID,
-        hidden_activation_type=NeuralNetwork.HiddenActivationType.RELU,
+        loss_type=NeuralNetwork.LossType.MULTI_CLASS_CROSS_ENTROPY,
+        output_activation_type=NeuralNetwork.OutputActivationType.SOFTMAX,
+        hidden_activation_type=NeuralNetwork.HiddenActivationType.TANH,
         device=NeuralNetwork.Device.GPU,
-        hidden_weight_init_strategy=NeuralNetwork.WeightInitStrategy.HE_NORMAL,
-        output_weight_init_strategy=NeuralNetwork.WeightInitStrategy.XAVIER_NORMAL,
+        hidden_weight_init_strategy=NeuralNetwork.WeightInitStrategy.HE_UNIFORM,
+        output_weight_init_strategy=NeuralNetwork.WeightInitStrategy.XAVIER_UNIFORM,
         bias_init_strategy=NeuralNetwork.BiasInitStrategy.ZERO,
         config=cfg,
     )
@@ -2422,9 +2431,6 @@ if __name__ == "__main__":
     # X_test = X_test[:limit]
     # Y_test = Y_test[:limit]
 
-    sample_x = X_test[2:3]
-    sample_y = Y_test[2:3]
-
     results = model.train(
         X_train,
         Y_train,
@@ -2435,14 +2441,14 @@ if __name__ == "__main__":
         learning_decay_type=None,
         data_augmentation_type=None,
         cfg=cfg,
-        _log=True,
+        _log=False,
         early_stopping=True,
         restore_best=True,
         finalize=True,
         l2=False,
         dropout=False,
-        graph=True,
-        synch=True,
+        graph=False,
+        synch=False,
         real_time_tracking=True,
         _log_predictions=False,
         error_analysis=False,
@@ -2454,6 +2460,6 @@ if __name__ == "__main__":
     model_name = "trained_model_digit_recognizer"
     model.save_model(model_name)
 
-    loaded_model = NeuralNetwork.load_model(
-        f"models/{model_name}.pkl", device=NeuralNetwork.Device.CPU
-    )
+    # loaded_model = NeuralNetwork.load_model(
+    #     f"models/{model_name}.pkl", device=NeuralNetwork.Device.CPU
+    # )
