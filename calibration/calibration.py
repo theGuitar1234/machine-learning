@@ -88,9 +88,9 @@ class Calibration:
             p_class = np.clip(p_class, epsilon, 1 - epsilon)
             score = np.log(p_class / (1 - p_class))
             binary_target = (true_classes == class_id).astype(np.float32)
-            
+
             A, B = 1, 0
-            self.calibrators.append(self._fit_platt_scaling(A, B, score, binary_target))            
+            self.calibrators.append(self._fit_platt_scaling(A, B, score, binary_target))
         return self.calibrators
 
     def _fit_platt_scaling(self, A, B, score, binary_target):
@@ -117,12 +117,12 @@ class Calibration:
             A, B = self.calibrators[class_id]
             calibrated_scores[:, class_id] = self.sigmoid(A * score + B)
         return self._normalize_calibrated_scores(calibrated_scores)
-    
+
     def _normalize_calibrated_scores(self, calibrated_scores):
         row_sums = np.sum(calibrated_scores, axis=1, keepdims=True)
         row_sums = np.clip(row_sums, self.config.epsilon, None)
         return calibrated_scores / row_sums
-    
+
     def isotonic_calibration(self, model, X_cal, Y_cal, number_of_classes):
         probabilities = model.predict_proba(X_cal)
         true_classes = np.argmax(Y_cal, axis=1)
@@ -137,9 +137,9 @@ class Calibration:
         ordered = np.argsort(scores)
         scores = scores[ordered]
         targets = targets[ordered]
-        
+
         blocks = []
-        
+
         for score, target in zip(scores, targets):
             block = {
                 "min_score": score,
@@ -147,31 +147,32 @@ class Calibration:
                 "value": target,
                 "weight": 1.0,
             }
-            
+
             blocks.append(block)
-            
+
             while len(blocks) >= 2 and blocks[-2]["value"] > blocks[-1]["value"]:
                 right = blocks.pop()
                 left = blocks.pop()
-                
+
                 total_weight = left["weight"] + right["weight"]
-                
+
                 merged = {
                     "min_score": left["min_score"],
                     "max_score": right["max_score"],
                     "value": (
-                        left["value"] * left["weight"] +
-                        right["value"] * right["weight"]
-                    ) / total_weight,
+                        left["value"] * left["weight"]
+                        + right["value"] * right["weight"]
+                    )
+                    / total_weight,
                     "weight": total_weight,
                 }
-                
+
                 blocks.append(merged)
         thresholds = np.array([block["max_score"] for block in blocks])
         values = np.array([block["value"] for block in blocks])
-        
+
         return thresholds, values
-    
+
     def predict_isotonic(self, model, X_new, number_of_classes):
         probabilities = model.predict_proba(X_new)
         calibrated_scores = np.empty(probabilities.shape)
@@ -183,18 +184,18 @@ class Calibration:
                 calibrator,
             )
         return self._normalize_calibrated_scores(calibrated_scores)
-    
+
     def _predict_isotonic_binary(self, scores, calibrator):
         thresholds, values = calibrator
         indices = np.searchsorted(thresholds, scores, side="left")
         indices = np.clip(indices, 0, len(values) - 1)
         return values[indices]
-    
+
     def temperature_scaling(self, neural_net, X_cal, Y_cal):
         logits = neural_net.predict_logits(X_cal)
         self._fit_temperature_scaling(Y_cal=Y_cal, logits=logits)
         return self.T
-    
+
     def _fit_temperature_scaling(self, Y_cal, logits):
         s = 0.0
         for _ in range(self.config.epochs):
@@ -203,18 +204,18 @@ class Calibration:
             s -= self.config.learning_rate * gradient
         self.T = np.exp(s)
         return self.T
-    
+
     def _temperature_gradient(self, logits, Y, s):
         h = self.config.h
         loss_plus = self._temperature_loss(logits, Y, s + h)
         loss_minus = self._temperature_loss(logits, Y, s - h)
         return (loss_plus - loss_minus) / (2 * h)
-    
+
     def _temperature_loss(self, logits, Y, s):
         T = np.exp(s)
         probabilities = self.softmax(logits / T)
         return self.log_loss(Y, probabilities)
-    
+
     def predict_temperature(self, neural_net, X_new):
         logits = neural_net.predict_logits(X_new)
         return self.softmax(logits / self.T)
@@ -224,7 +225,7 @@ class Calibration:
         Z_shifted = Z - np.max(Z, axis=1, keepdims=True)
         exp_Z = np.exp(Z_shifted)
         return exp_Z / np.sum(exp_Z, axis=1, keepdims=True)
-    
+
     def brier_score(self, y, y_hat):
         return np.mean(np.sum((y_hat - y) ** 2, axis=1))
 
@@ -280,22 +281,22 @@ if __name__ == "__main__":
     print(f"ECE Score: {ECE}")
     print(f"Brier Score: {brier_score}")
     print(f"Log Loss : {log_loss}")
-    
+
     X_cal = prepared_dataset["X_valid"]
     Y_cal = prepared_dataset["Y_valid"]
-    
+
     X_cal = X_cal.astype(np.float32) / 255.0
-    
+
     # calibration.platt_scaling(loaded_model, X_cal, Y_cal, number_of_classes)
     # predictions = calibrated_prediction = calibration.predict_calibrated(
     #     loaded_model,
     #     X_test,
     #     number_of_classes
     # )
-    
+
     # confidence = np.max(predictions, axis=1)
     # calibration.reliability_diagram(correct, confidence, number_of_classes, verbose=True)
-    
+
     # calibration.isotonic_calibration(loaded_model, X_cal, Y_cal, number_of_classes)
 
     # predictions = calibration.predict_isotonic(
@@ -303,12 +304,12 @@ if __name__ == "__main__":
     #     X_test,
     #     number_of_classes,
     # )
-    
+
     # confidence = np.max(predictions, axis=1)
     # calibration.reliability_diagram(correct, confidence, number_of_classes, verbose=True)
 
     calibration.temperature_scaling(loaded_model, X_cal, Y_cal)
-    
+
     predictions = calibration.predict_temperature(loaded_model, X_test)
 
     y_hat = np.argmax(predictions, axis=1)

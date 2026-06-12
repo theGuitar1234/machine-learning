@@ -14,6 +14,7 @@ from trees import ANonSeriousDecisionTree
 from trees import ANonSeriousSymmetricalTree
 
 import math
+import pickle
 
 from trees.a_non_serious_path_element import ANonSeriousPathElement
 
@@ -37,12 +38,12 @@ class CatBoost:
         min_combo_count: int = 5
         max_number_of_combos: int = 20
         one_hot_max_size: int = 2
+        learning_rate: float = 0.03
 
     def __init__(
         self,
         seed=42,
         boosting_rounds=100,
-        learning_rate=0.03,
         max_depth=10,
         minimum_population_size=2,
         minimum_gain=0.001,
@@ -72,7 +73,6 @@ class CatBoost:
         self.sub_sample = sub_sample
         self.column_sub_sample = column_sub_sample
         self.boosting_rounds = boosting_rounds
-        self.learning_rate = learning_rate
         self.max_depth = max_depth
         self.minimum_population_size = minimum_population_size
         self.minimum_gain = minimum_gain
@@ -84,7 +84,7 @@ class CatBoost:
         self.early_stopping = early_stopping
         self.restore_best = restore_best
         self.validation = validation
-        self.categorical_features = categorical_features or []
+        self.categorical_features = list(categorical_features) or []
         self.categorical_combinations = categorical_combinations or []
         self.one_hot_features = []
         self.ctr_features = []
@@ -100,15 +100,38 @@ class CatBoost:
         self.F_x = None
         self.F_0x = None
 
-    def fit(self, X, y, X_val, y_val):
+    def fit(
+        self, 
+        X, 
+        y,
+        X_test,
+        y_test,
+        X_val, 
+        y_val,
+        finalize=False,
+        log=False,
+        threshold=0.5,
+    ):
+        X = np.asarray(X)
+        y = np.asarray(y)
+        X_val = np.asarray(X_val)
+        y_val = np.asarray(y_val)
+        if y.ndim == 2 and y.shape[1] == 1:
+            y = y.ravel()
+            y_val = y_val.ravel()
+        elif y.ndim == 2 and y.shape[1] > 1:
+            y = np.argmax(np.asarray(y), axis=1)
+            y_val = np.argmax(np.asarray(y_val), axis=1)
         self.X_train_ = X
         self.y_train_ = y
-
         self.trees = []
         self.feature_indices = []
         self.encoding_statistics = []
+        
+        learning_rate = self.config.learning_rate
 
         X_model = self._feature_transformer(X, y)
+        X_val = self._transform_features(X_val, training_mode=False)
         self.X_train_ = X_model
         X = X_model
 
@@ -131,12 +154,14 @@ class CatBoost:
                     f"Unsupported {self.LossType}, supported values are {list(self.LossType)}"
                 )
         self.F_x = np.repeat(self.F_0x, y.shape[0])
+        self.F_val = np.repeat(self.F_0x, y_val.shape[0])
 
         best_val_loss = float("inf")
         patience = 100
         best_round = -1
         best_number_of_trees = 0
         patience_counter = 0
+        print("\nTraining CatBoost...\n")
         for round in range(self.boosting_rounds):
             pseudo_residual = -self.dloss(y, self.F_x)
 
@@ -190,10 +215,20 @@ class CatBoost:
 
             self.trees.append(tree)
             self.feature_indices.append(feature_indices)
-            self.F_x += self.learning_rate * tree.predict(X[:, feature_indices])
+            self.F_x += learning_rate * tree.predict(X[:, feature_indices])
 
             if self.validation:
-                _, val_loss = self.evaluate_dataset(X_val, y_val)
+                # val_acc, val_loss = self.evaluate_dataset(X_val, y_val)
+                X_sub_val = X_val[:, feature_indices]
+                self.F_val += learning_rate * tree.predict(X_sub_val)
+                probability = self.sigmoid(self.F_val)
+                predicted_class = probability >= threshold
+                val_acc = np.mean(predicted_class == y_val) * 100.0
+                match self.loss_type:
+                    case self.LossType.BINARY_CROSS_ENTROPY:
+                        val_loss = self.binary_cross_entropy_loss(y_val, self.F_val)
+                    case self.LossType.SSE:
+                        val_loss = self.sse(y_val, self.F_val)
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     best_round = round
@@ -201,6 +236,11 @@ class CatBoost:
                     best_number_of_trees = len(self.trees)
                 else:
                     patience_counter += 1
+                if log:
+                    print(
+                        f"[ Boosting Round {round:.6f} ] [ Validation Loss {val_loss:.6f} ] [ Validation Accuracy: {val_acc:.2f} ]",
+                        end="\r"
+                    )
                 if self.early_stopping and patience_counter >= patience:
                     print(
                         "Overfitting detected. Early stopping at round: ",
@@ -210,16 +250,45 @@ class CatBoost:
                     )
                     break
         if self.restore_best and self.validation:
-            self.trees = self.trees[:best_number_of_trees]
-            self.feature_indices = self.feature_indices[:best_number_of_trees]
-            self.F_x = np.repeat(self.F_0x, X.shape[0])
-            for tree, feature_indices in zip(self.trees, self.feature_indices):
-                self.F_x += self.learning_rate * tree.predict(X[:, feature_indices])
+            if best_number_of_trees > 0:
+                self.trees = self.trees[:best_number_of_trees]
+                self.feature_indices = self.feature_indices[:best_number_of_trees]
+                self.F_x = np.repeat(self.F_0x, X.shape[0])
+                for tree, feature_indices in zip(self.trees, self.feature_indices):
+                    self.F_x += learning_rate * tree.predict(X[:, feature_indices])
+        if finalize:
+            acc, loss = self.evaluate_dataset(X_test, y_test)
+            print(f"\n\nFinal Results: ")
+            print(f"Accuracy: {acc}")
+            print(f"Loss: {loss}")
         return self
 
-    def fit_ordered(self, X, y, X_val=None, y_val=None):
+    def fit_ordered(
+        self, 
+        X, 
+        y,
+        X_test,
+        y_test,
+        X_val=None, 
+        y_val=None,
+        finalize=False,
+        log=False,
+        threshold=0.5,
+    ):
+        X = np.asarray(X)
+        y = np.asarray(y)
+        X_val = np.asarray(X_val)
+        y_val = np.asarray(y_val)
+        if y.ndim == 2 and y.shape[1] == 1:
+            y = y.ravel()
+            y_val = y_val.ravel()
+        elif y.ndim == 2 and y.shape[1] > 1:
+            y = np.argmax(np.asarray(y), axis=1)
+            y_val = np.argmax(np.asarray(y_val), axis=1)
         self.X_train_ = X
         self.y_train_ = y
+        
+        learning_rate = self.config.learning_rate
 
         self.trees = []
         self.feature_indices = []
@@ -322,7 +391,7 @@ class CatBoost:
                 )
             self.trees.append(tree)
             self.feature_indices.append(feature_indices)
-            self.F_x += self.learning_rate * tree.predict(X[:, feature_indices])
+            self.F_x += learning_rate * tree.predict(X[:, feature_indices])
 
             for b in range(number_of_blocks):
                 prefix_rows = np.concatenate(ordered_blocks[: b + 1])
@@ -356,12 +425,21 @@ class CatBoost:
                     y_prefix_original,
                     ordered_prediction[prefix_rows],
                 )
-                self.F_prefix[b] += self.learning_rate * auxiliary_tree.predict(
+                self.F_prefix[b] += learning_rate * auxiliary_tree.predict(
                     X[:, feature_indices]
                 )
 
             if self.validation:
-                _, val_loss = self.evaluate_dataset(X_val, y_val)
+                # val_acc, val_loss = self.evaluate_dataset(X_val, y_val)
+                self.F_val += learning_rate * tree.predict(X_val)
+                probability = self.sigmoid(self.F_val)
+                predicted_class = probability >= threshold
+                val_acc = np.mean(predicted_class == y_val) * 100.0
+                match self.loss_type:
+                    case self.LossType.BINARY_CROSS_ENTROPY:
+                        val_loss = self.binary_cross_entropy_loss(y_val, self.F_val)
+                    case self.LossType.SSE:
+                        val_loss = self.sse(y_val, self.F_val)
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     best_round = round
@@ -369,6 +447,11 @@ class CatBoost:
                     best_number_of_trees = len(self.trees)
                 else:
                     patience_counter += 1
+                if log:
+                    print(
+                        f"[ Boosting Round {round:.6f} ] [ Validation Loss {val_loss:.6f} ] [ Validation Accuracy: {val_acc:.2f} ]",
+                        end="\r"
+                    )
                 if self.early_stopping and patience_counter >= patience:
                     print(
                         "Overfitting detected. Early stopping at round: ",
@@ -378,11 +461,17 @@ class CatBoost:
                     )
                     break
         if self.restore_best and self.validation:
-            self.trees = self.trees[:best_number_of_trees]
-            self.feature_indices = self.feature_indices[:best_number_of_trees]
-            self.F_x = np.repeat(self.F_0x, X.shape[0])
-            for tree, feature_indices in zip(self.trees, self.feature_indices):
-                self.F_x += self.learning_rate * tree.predict(X[:, feature_indices])
+            if best_number_of_trees > 0:
+                self.trees = self.trees[:best_number_of_trees]
+                self.feature_indices = self.feature_indices[:best_number_of_trees]
+                self.F_x = np.repeat(self.F_0x, X.shape[0])
+                for tree, feature_indices in zip(self.trees, self.feature_indices):
+                    self.F_x += learning_rate * tree.predict(X[:, feature_indices])
+        if finalize:
+            acc, loss = self.evaluate_dataset(X_test, y_test)
+            print(f"\n\nFinal Results: ")
+            print(f"Accuracy: {acc}")
+            print(f"Loss: {loss}")
         return self
 
     def _local_categorical_features(self, feature_indices):
@@ -596,22 +685,29 @@ class CatBoost:
                     f"Unsupported {self.LossType}, supported values are {list(self.LossType)}"
                 )
 
-    def evaluate_dataset(self, X, y):
-        if y.ndim == 2:
-            y = np.argmax(y, axis=1)
+    def evaluate_dataset(self, X, y, threshold=0.5):
+        X = np.asarray(X)
+        y = np.asarray(y)
+        if y.ndim == 2 and y.shape[1] == 1:
+            y = y.ravel()
+        elif y.ndim == 2 and y.shape[1] > 1:
+            y = np.argmax(np.asarray(y), axis=1)
         F_x = self.predict(X)
-        predictions = np.asarray(F_x)
         loss = None
         match self.loss_type:
             case self.LossType.BINARY_CROSS_ENTROPY:
                 loss = self.binary_cross_entropy_loss(y, F_x)
+                probability = self.sigmoid(F_x)
+                predicted_class = probability >= threshold
             case self.LossType.SSE:
                 loss = self.sse_mean(y, F_x)
+                predicted_class = F_x >= threshold
             case _:
                 raise ValueError(
                     f"Unsupported {self.LossType}, supported values are {list(self.LossType)}"
                 )
-        return predictions, loss
+        accuracy = np.mean(predicted_class == y) * 100.0
+        return accuracy, loss
 
     def predict(self, X):
         if self.F_0x is None:
@@ -619,8 +715,11 @@ class CatBoost:
         X_model = self._transform_features(X, training_mode=False)
         prediction = np.repeat(self.F_0x, X.shape[0])
         for tree, feature_indices in zip(self.trees, self.feature_indices):
-            prediction += self.learning_rate * tree.predict(X_model[:, feature_indices])
+            prediction += self.config.learning_rate * tree.predict(X_model[:, feature_indices])
         return prediction
+    
+    def predict_proba(self, X):
+        return self.sigmoid(self.predict(X))
 
     def agnostic_shapley(
         self,
@@ -855,6 +954,8 @@ class CatBoost:
         number_of_transformed_features = transformed_row.shape[1]
         total_phi = np.zeros(number_of_transformed_features)
         base_value = self.F_0x
+        
+        learning_rate = self.config.learning_rate
 
         for tree_index in range(self.boosting_rounds):
             tree = self.trees[tree_index]
@@ -867,11 +968,11 @@ class CatBoost:
                 number_of_local_features=len(feature_indices),
             )
 
-            base_value += self.learning_rate * tree_result["tree_expected"]
+            base_value += learning_rate * tree_result["tree_expected"]
             for local_feature_position in range(len(feature_indices)):
                 global_transformed_feature = feature_indices[local_feature_position]
                 total_phi[global_transformed_feature] += (
-                    self.learning_rate * tree_result["tree_phi"][local_feature_position]
+                    learning_rate * tree_result["tree_phi"][local_feature_position]
                 )
         prediction = self.predict(raw_row)
         reconstructed = base_value + np.sum(total_phi)
@@ -1130,12 +1231,13 @@ class CatBoost:
         running_prediction = baseline
         tree_explanations = []
         number_of_trees = self.boosting_rounds
+        learning_rate = self.config.learning_rate
         for tree_index in range(number_of_trees):
             tree = self.trees[tree_index]
             feature_indices = self.feature_indices[tree_index]
             tree_rows = transformed_row[:, feature_indices]
             raw_tree_output = tree.predict(tree_rows)
-            contribution = self.learning_rate * raw_tree_output
+            contribution = learning_rate * raw_tree_output
             running_prediction = running_prediction + contribution
             record = {
                 "tree_index": tree_index,
@@ -1394,6 +1496,32 @@ class CatBoost:
         category_counts = [self.categorical_features.count(value) for value in values]
         print(category_counts)
         return np.sort(category_counts)[:max_categories]
+    
+    def save_model(
+        self, 
+        file_name, 
+        meta=False, 
+        format_version=None, 
+        train_history=False
+    ):
+        if not file_name.endswith(".pkl"):
+            file_name = file_name + ".pkl"
+
+        modelpath = "boosting/models"
+        if modelpath is not None and not os.path.exists(modelpath):
+            os.mkdir(modelpath)
+
+        file_path = modelpath + file_name
+        with open(file_path, "wb") as f:
+            pickle.dump(self, f)
+        print(f"\nSaved the Model to : {file_path}\n")
+
+        if meta:
+            meta_data = self.get_metadata(format_version, train_history)
+            meta_data_path = modelpath + file_name + self.Paths.meta_data_flair
+            with open(meta_data_path, "wb") as f:
+                pickle.dump(meta_data, f)
+            print(f"\nSaved Meta Data at : {meta_data_path}\n")
 
     def verbose_permutation_importance(
         self,
@@ -1444,6 +1572,8 @@ class CatBoost:
     def visualize(self):
         if self.X_train_ is None or self.y_train_ is None:
             raise RuntimeError("Model is not fit")
+        
+        learning_rate = self.config.learning_rate
 
         os.makedirs("boosting/img", exist_ok=True)
 
@@ -1497,7 +1627,7 @@ class CatBoost:
         losses.append(initial_mse)
 
         for tree, feature_indices in zip(self.trees, self.feature_indices):
-            current_pred += self.learning_rate * tree.predict(X[:, feature_indices])
+            current_pred += learning_rate * tree.predict(X[:, feature_indices])
             mse = np.mean((y - current_pred) ** 2)
             losses.append(mse)
 
@@ -1519,7 +1649,7 @@ class CatBoost:
         prediction_history.append(current_pred[:sample_count].copy())
 
         for tree, feature_indices in zip(self.trees, self.feature_indices):
-            current_pred += self.learning_rate * tree.predict(X[:, feature_indices])
+            current_pred += learning_rate * tree.predict(X[:, feature_indices])
             prediction_history.append(current_pred[:sample_count].copy())
 
         prediction_history = np.asarray(prediction_history)

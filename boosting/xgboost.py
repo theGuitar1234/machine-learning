@@ -7,6 +7,7 @@ from sklearn.model_selection import train_test_split
 from trees import ANonSeriousDecisionTree
 import matplotlib.pyplot as plt
 import os
+import pickle
 
 
 class XGBoost:
@@ -22,7 +23,7 @@ class XGBoost:
         gamma: float = 0.2
         threshold: float = 0.5
         learning_rate: float = 0.03
-        validation_tolerance: float = 10
+        validation_tolerance: float = 1e-4
         patience: int = 100
         batch_size: int = 50
         max_xgboost_bins: int = 50
@@ -85,8 +86,30 @@ class XGBoost:
         self.purpose_missing = purpose_missing
         self.preprocess = preprocess
         self.batch_training = batch_training
+        self.vectorized = vectorized
 
-    def fit(self, X, y, X_val, y_val, optimized=False):
+    def fit(
+        self, 
+        X, 
+        y, 
+        X_test,
+        y_test,
+        X_val, 
+        y_val, 
+        optimized=False,
+        finalize=False,
+        threshold=0.5,
+    ):
+        X = np.asarray(X)
+        y = np.asarray(y)
+        X_val = np.asarray(X_val)
+        y_val = np.asarray(y_val)
+        if y.ndim == 2 and y.shape[1] == 1:
+            y = y.ravel()
+            y_val = y_val.ravel()
+        elif y.ndim == 2 and y.shape[1] > 1:
+            y = np.argmax(np.asarray(y), axis=1)
+            y_val = np.argmax(np.asarray(y_val), axis=1)
         self.X_train_ = X
         self.y_train_ = y
 
@@ -117,6 +140,7 @@ class XGBoost:
                 )
 
         self.F_x = np.repeat(self.F_0x, y.shape[0])
+        self.F_val = np.repeat(self.F_0x, y_val.shape[0])
 
         number_of_samples = X.shape[0]
         number_of_features = X.shape[1]
@@ -130,6 +154,7 @@ class XGBoost:
         best_round = -1
         best_number_of_trees = 0
         patience_counter = 0
+        print("\nTraining XGBoost...\n")
         for round in range(self.boosting_rounds):
             tree = ANonSeriousDecisionTree(
                 max_depth=self.max_depth,
@@ -141,7 +166,7 @@ class XGBoost:
                 random_criterion=self.random_criterion,
                 tree_type=self.tree_type,
                 xgboost=True,
-                vectorized=False,
+                vectorized=self.vectorized,
                 xgboost_split=self.xgboost_split,
                 xgboost_proposal=self.proposal,
                 xgboost_candidate_proposal=self.candidate_proposal,
@@ -195,8 +220,18 @@ class XGBoost:
             self.feature_indices.append(feature_indices)
             self.F_x += learning_rate * tree.predict(X[:, feature_indices])
 
-            _, val_loss = self.evaluate_dataset(X_val, y_val)
-            if (best_val_loss - val_loss > validation_tolerance):
+            # val_acc, val_loss = self.evaluate_dataset(X_val, y_val)
+            X_sub_val = X_val[:, feature_indices]
+            self.F_val += learning_rate * tree.predict(X_sub_val)
+            probability = self.sigmoid(self.F_val)
+            predicted_class = probability >= threshold
+            val_acc = np.mean(predicted_class == y_val) * 100.0
+            match self.loss_type:
+                case self.LossType.BINARY_CROSS_ENTROPY:
+                    val_loss = self.binary_cross_entropy_loss(y_val, self.F_val)
+                case self.LossType.SSE:
+                    val_loss = self.sse(y_val, self.F_val)
+            if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_round = round
                 patience_counter = 0
@@ -216,15 +251,21 @@ class XGBoost:
                 tree_score = self.tree_structure_score(tree)
                 progression = round % loading_bar_length
                 print(
-                    f"Fitting the tree{loading*progression + space*(loading_bar_length - progression)} [ XGBoost Penalty : {penalty:.2f} ] [ Tree Structure Score : {tree_score:.2f} ] [ Validation Loss : {val_loss} Best : {best_val_loss} Patience : {patience_counter}]{space*padding}",
+                    f"Fitting the tree{loading*progression + space*(loading_bar_length - progression)} [ XGBoost Penalty : {penalty:.2f} ] [ Tree Structure Score : {tree_score:.2f} ] [ Validation Loss : {val_loss} Best : {best_val_loss} Validation Accuracy : {val_acc} Patience : {patience_counter}]{space*padding}",
                     end="\r"
                 )
         if self.restore_best:
-            self.trees = self.trees[:best_number_of_trees]
-            self.feature_indices = self.feature_indices[:best_number_of_trees]
-            self.F_x = np.repeat(self.F_0x, X.shape[0])
-            for tree, feature_indices in zip(self.trees, self.feature_indices):
-                self.F_x += learning_rate * tree.predict(X[:, feature_indices])
+            if best_number_of_trees > 0:
+                self.trees = self.trees[:best_number_of_trees]
+                self.feature_indices = self.feature_indices[:best_number_of_trees]
+                self.F_x = np.repeat(self.F_0x, X.shape[0])
+                for tree, feature_indices in zip(self.trees, self.feature_indices):
+                    self.F_x += learning_rate * tree.predict(X[:, feature_indices])
+        if finalize:
+            acc, loss = self.evaluate_dataset(X_test, y_test)
+            print(f"\n\nFinal Results: ")
+            print(f"Accuracy: {acc}")
+            print(f"Loss: {loss}")
         return self
 
     def dloss(self, y, F_x):
@@ -321,22 +362,29 @@ class XGBoost:
         p_x = np.clip(p_x, epsilon, 1.0 - epsilon)
         return -np.sum(y * np.log(p_x) + (1 - y) * np.log(1 - p_x)) / m
 
-    def evaluate_dataset(self, X, y):
-        if y.ndim == 2:
-            y = np.argmax(y, axis=1)
+    def evaluate_dataset(self, X, y, threshold=0.5):
+        X = np.asarray(X)
+        y = np.asarray(y)
+        if y.ndim == 2 and y.shape[1] == 1:
+            y = y.ravel()
+        elif y.ndim == 2 and y.shape[1] > 1:
+            y = np.argmax(np.asarray(y), axis=1)
         F_x = self.predict(X)
-        predictions = np.asarray(F_x)
         loss = None
         match self.loss_type:
             case self.LossType.BINARY_CROSS_ENTROPY:
                 loss = self.binary_cross_entropy_loss(y, F_x)
+                probability = self.sigmoid(F_x)
+                predicted_class = probability >= threshold
             case self.LossType.SSE:
                 loss = self.sse_mean(y, F_x)
+                predicted_class = F_x >= threshold
             case _:
                 raise ValueError(
                     f"Unsupported {self.LossType}, supported values are {list(self.LossType)}"
                 )
-        return predictions, loss
+        accuracy = np.mean(predicted_class == y) * 100.0
+        return accuracy, loss
 
     def predict(self, X):
         prediction = np.repeat(self.F_0x, X.shape[0])
@@ -350,6 +398,32 @@ class XGBoost:
     def predict_class(self, X):
         threshold = self.config.threshold
         return (self.predict_proba(X) >= threshold).astype(int)
+
+    def save_model(
+        self, 
+        file_name, 
+        meta=False, 
+        format_version=None, 
+        train_history=False
+    ):
+        if not file_name.endswith(".pkl"):
+            file_name = file_name + ".pkl"
+
+        modelpath = "boosting/models"
+        if modelpath is not None and not os.path.exists(modelpath):
+            os.mkdir(modelpath)
+
+        file_path = modelpath + file_name
+        with open(file_path, "wb") as f:
+            pickle.dump(self, f)
+        print(f"\nSaved the Model to : {file_path}\n")
+
+        if meta:
+            meta_data = self.get_metadata(format_version, train_history)
+            meta_data_path = modelpath + file_name + self.Paths.meta_data_flair
+            with open(meta_data_path, "wb") as f:
+                pickle.dump(meta_data, f)
+            print(f"\nSaved Meta Data at : {meta_data_path}\n")
 
     def visualize(self):
         if self.X_train_ is None or self.y_train_ is None:

@@ -136,7 +136,7 @@ if __name__ == "__main__":
 
         return X, y
         
-    dataset = datasets.load_iris()
+    # dataset = datasets.load_iris()
     seed = 42
 
     # X, y = circle_of_clouds(10, 30, seed=seed)
@@ -148,20 +148,20 @@ if __name__ == "__main__":
     #     sigma=0.04,
     #     seed=42
     # )
-    # X, y = spiral_of_clouds(
-    #     n_objects_by_class=150,
-    #     radius=5,
-    #     n_turns=3,
-    #     sigma=0.08,
-    #     seed=42,
-    #     b=0.12
-    # )
-    feature1 = 2
-    feature2 = 3
+    X, y = spiral_of_clouds(
+        n_objects_by_class=150,
+        radius=5,
+        n_turns=3,
+        sigma=0.08,
+        seed=42,
+        b=0.12
+    )
+    feature1 = 0
+    feature2 = 1
 
-    X = dataset.data[:, [feature1, feature2]]
-    X = dataset.data
-    y = dataset.target
+    # X = dataset.data[:, [feature1, feature2]]
+    # X = dataset.data
+    # y = dataset.target
 
     # X, y = make_regression(
     #     n_samples=300,
@@ -261,7 +261,7 @@ if __name__ == "__main__":
         information_gain=ANonSeriousDecisionTree.InformationGain.ENTROPY,
         random_criterion=ANonSeriousDecisionTree.RandomCriterion.RANDOM_SPLIT,
         _bootstrap=False,
-        forest_type=ANonSeriousRandomForest.ForestType.CLASSIFICATION,
+        forest_type=ANonSeriousRandomForest.ForestType.REGRESSION,
         voting=ANonSeriousRandomForest.Voting.SOFT,
         max_depth=15,
         number_of_trees=50,
